@@ -38,3 +38,4 @@ jobs:
       - run: $DSH plugin --profile ci-autocompact add /tmp/autocompact-pkg/*.tgz
       - run: $DSH --profile ci-autocompact --dump-config | tee /tmp/config.txt | grep idle-autocompact
       - run: $DSH --profile ci-autocompact --dump-config-schema | tee /tmp/schema.json | grep minutes
+      - run: tar -tzf /tmp/autocompact-pkg/*.tgz | grep package/client/client.js

@@ -19,8 +19,13 @@ inside each agent preset.
 
 ## Configure
 
-Open **Settings -> Plugins -> idle-autocompact** and edit `rules`, or set it in the
-patch:
+Open **Plugins** in the sidebar, then **dsh-autocompact** under *Installed plugins*,
+and click **Configure** on the `idle-autocompact` row. Add rows of provider, model
+and idle minutes, then **Save**. Saving applies to running sessions without a
+restart. (**Settings -> Built-in plugins** is a read-only inventory and has no
+form for this plugin.)
+
+Or set it in your profile patch:
 
 ```yaml
 - id: idle-autocompact
