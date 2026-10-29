@@ -161,8 +161,10 @@ export class IdleCompactor<A extends IdleAgent> {
   private readonly handles = new Map<A, unknown>()
   private readonly inflight = new Set<AbortController>()
   private readonly timers: Timers
+  private readonly deps: IdleCompactorDeps<A>
 
-  constructor(private readonly deps: IdleCompactorDeps<A>) {
+  constructor(deps: IdleCompactorDeps<A>) {
+    this.deps = deps
     this.timers = deps.timers ?? realTimers
   }
 
