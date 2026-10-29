@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --experimental-strip-types --test index.test.ts"
+    "test": "node --experimental-strip-types --test index.test.ts client.test.ts"
   },
   "repository": {
     "type": "git",

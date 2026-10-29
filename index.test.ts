@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   apply,
+  Config,
   IdleCompactor,
   inject,
   resolveIdleMinutes,
@@ -122,7 +123,7 @@ describe('IdleCompactor', () => {
     const compacted: IdleAgent[] = []
     const warnings: string[] = []
     const compactor = new IdleCompactor<IdleAgent>({
-      rules,
+      rules: () => rules,
       timers,
       compact: async (agent, signal) => {
         compacted.push(agent)
@@ -211,6 +212,58 @@ describe('IdleCompactor', () => {
     compactor.dispose()
     assert.equal(timers.pending.size, 0)
     assert.equal(seen?.aborted, true)
+  })
+
+  it('refresh re-arms idle agents with the minutes of the current rules', () => {
+    let rules: Rule[] = [{ provider: 'deepseek', minutes: 5 }]
+    const timers = fakeTimers()
+    const compactor = new IdleCompactor<IdleAgent>({
+      rules: () => rules,
+      timers,
+      compact: async () => ({}),
+      log: { info: () => {}, warn: () => {} },
+    })
+    compactor.arm(fakeAgent())
+    rules = [{ provider: 'deepseek', minutes: 1 }]
+    compactor.refresh()
+    assert.equal(timers.pending.size, 1)
+    assert.equal([...timers.pending.values()][0]?.ms, MINUTE)
+  })
+
+  it('refresh arms an idle agent that had no rule before and drops one whose rule is gone', () => {
+    let rules: Rule[] = []
+    const timers = fakeTimers()
+    const compactor = new IdleCompactor<IdleAgent>({
+      rules: () => rules,
+      timers,
+      compact: async () => ({}),
+      log: { info: () => {}, warn: () => {} },
+    })
+    compactor.arm(fakeAgent())
+    assert.equal(timers.pending.size, 0)
+    rules = [{ provider: 'deepseek', minutes: 5 }]
+    compactor.refresh()
+    assert.equal(timers.pending.size, 1)
+    rules = []
+    compactor.refresh()
+    assert.equal(timers.pending.size, 0)
+  })
+
+  it('refresh leaves running, disposed and already compacted agents alone', async () => {
+    const { timers, compacted, compactor } = setup([{ provider: 'deepseek', minutes: 5 }])
+    const running = fakeAgent()
+    const gone = fakeAgent()
+    const done = fakeAgent()
+    compactor.arm(running)
+    compactor.disarm(running)
+    compactor.arm(gone)
+    compactor.disarm(gone)
+    compactor.arm(done)
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(compacted, [done])
+    compactor.refresh()
+    assert.equal(timers.pending.size, 0)
   })
 })
 
@@ -331,5 +384,59 @@ describe('apply', () => {
     assert.equal(timers.pending.size, 1)
     for (const dispose of disposers) void dispose()
     assert.equal(timers.pending.size, 0)
+  })
+
+  describe('live rules', () => {
+    function liveRules(initial: Rule[]) {
+      const box = { current: initial }
+      return { box, ref: { get: () => box.current } }
+    }
+
+    it('reads rules through the volatile reference each time an agent goes idle', () => {
+      const { ctx, emit } = fakeCtx()
+      const timers = fakeTimers()
+      const { box, ref } = liveRules([{ provider: 'deepseek', minutes: 5 }])
+      apply(ctx as never, { rules: ref } as never, timers)
+      box.current = [{ provider: 'deepseek', minutes: 2 }]
+      emit('agent/status', { agent: fakeAgent(), status: 'idle' })
+      assert.equal([...timers.pending.values()][0]?.ms, 2 * MINUTE)
+    })
+
+    it('re-arms idle agents when the volatile rules change', () => {
+      const { ctx, emit } = fakeCtx()
+      const timers = fakeTimers()
+      const { box, ref } = liveRules([{ provider: 'deepseek', minutes: 5 }])
+      apply(ctx as never, { rules: ref } as never, timers)
+      emit('agent/status', { agent: fakeAgent(), status: 'idle' })
+      box.current = [{ provider: 'deepseek', minutes: 1 }]
+      emit('loader/volatile-update', [['rules']])
+      assert.equal(timers.pending.size, 1)
+      assert.equal([...timers.pending.values()][0]?.ms, MINUTE)
+    })
+
+    it('warns and arms nothing when the changed rules are invalid', () => {
+      const { ctx, emit, warnings } = fakeCtx()
+      const timers = fakeTimers()
+      const { box, ref } = liveRules([{ provider: 'deepseek', minutes: 5 }])
+      apply(ctx as never, { rules: ref } as never, timers)
+      emit('agent/status', { agent: fakeAgent(), status: 'idle' })
+      box.current = [{ minutes: 5 }]
+      emit('loader/volatile-update', [['rules']])
+      assert.equal(timers.pending.size, 0)
+      assert.match(warnings.join('\n'), /provider or model/)
+    })
+
+    it('rejects an invalid volatile table at load', () => {
+      const { ctx } = fakeCtx()
+      const { ref } = liveRules([{ minutes: 5 }])
+      assert.throws(() => apply(ctx as never, { rules: ref } as never), /provider or model/)
+    })
+  })
+})
+
+describe('Config', () => {
+  it('marks rules volatile so the Settings form exposes it and edits apply without a reload', () => {
+    const rules = (Config as unknown as { dict: Record<string, { meta: { volatile?: boolean } }> }).dict.rules
+    assert.equal(rules?.meta.volatile, true)
   })
 })
