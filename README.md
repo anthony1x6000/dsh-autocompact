@@ -2,7 +2,7 @@
 
 Idle autocompact for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 After a session has been idle for **N minutes**, it is condensed with the same
-engine behind `/compact` (`ctx.compaction.compactNow()`). N is configured per
+engine behind `/compact`, run through the `commands` service. N is configured per
 model route, so a provider whose prompt cache expires quickly can compact sooner
 than one that keeps it warm.
 
@@ -12,7 +12,10 @@ than one that keeps it warm.
 dsh plugin --profile web add "github:anthony1x6000/dsh-autocompact#main"
 ```
 
-Requires a mounted compaction backend (the default `dsh` base has one).
+Needs the `/compact` command, which every `dsh` profile with a compaction backend
+provides, including the web profile. The plugin runs at the profile root and calls
+the command, so it works even though the web profile builds its compaction backend
+inside each agent preset.
 
 ## Configure
 

@@ -303,6 +303,14 @@ describe('apply', () => {
     assert.match(warnings.join('\n'), /could not produce a useful summary/)
   })
 
+  it('skips quietly when compaction is unavailable because one is running or the agent is busy', async () => {
+    const { ctx, emit, warnings } = fakeCtx({
+      result: { kind: 'error', text: 'Compaction is unavailable because this process has an active compaction, or the agent is not idle.' },
+    })
+    await fireIdle(ctx, emit)
+    assert.deepEqual(warnings, [])
+  })
+
   it('warns when no /compact command is registered for the agent', async () => {
     const { ctx, emit, warnings } = fakeCtx(undefined)
     await fireIdle(ctx, emit)
