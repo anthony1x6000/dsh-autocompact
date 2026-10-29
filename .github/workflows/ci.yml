@@ -19,3 +19,19 @@ jobs:
       - run: pnpm install
       - run: pnpm build
       - run: pnpm test
+
+  install:
+    runs-on: ubuntu-latest
+    env:
+      DSH: /tmp/dsh-cli/node_modules/.bin/dsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Hermetic CLI install; native builds are the set pnpm gates, approved explicitly.
+      - run: mkdir -p /tmp/dsh-cli && cd /tmp/dsh-cli && pnpm init -y > /dev/null && pnpm add @deepseek-ai/dsh@0.2.1-rc.2 --allow-build @deepseek-ai/dsh-subprocess-local --allow-build @google/genai --allow-build koffi --allow-build node-pty --allow-build protobufjs
+      - run: $DSH plugin --profile ci-autocompact add .
+      - run: $DSH --profile ci-autocompact --dump-config | tee /tmp/config.txt | grep idle-autocompact
+      - run: $DSH --profile ci-autocompact --dump-config-schema | tee /tmp/schema.json | grep minutes
