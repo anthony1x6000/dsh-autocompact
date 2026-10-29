@@ -2,7 +2,7 @@
  * Idle autocompact for the DeepSeek Harness.
  *
  * After a session has been idle for N minutes (the minutes configured for the
- * model route it last used), `ctx.compaction.compactNow()` condenses it. Useful
+ * model route it last used), the `/compact` command condenses it. Useful
  * when a provider's prompt cache expires after a quiet period: the next turn
  * then starts from a short summary instead of re-reading a long cold history.
  *
@@ -16,7 +16,11 @@
 import z from '@deepseek-ai/schemastery';
 /** Cordis plugin name used by loader diagnostics. */
 export declare const name = "idle-autocompact";
-/** The compaction backend this plugin triggers. */
+/**
+ * The command registry, which is mounted at root in every profile. The
+ * compaction backend itself is not: the web profile builds it inside each agent
+ * preset, so a root plugin injecting `compaction` would wait forever.
+ */
 export declare const inject: string[];
 /** One idle rule: a route selector plus the idle minutes before compaction. */
 export interface Rule {
@@ -108,11 +112,13 @@ export declare class IdleCompactor<A extends IdleAgent> {
 }
 /** Minimal Cordis context surface this plugin touches. */
 export interface PluginContext {
-    compaction: {
-        compactNow(agent: IdleAgent, signal: AbortSignal): Promise<{
-            shadowedSeqs: readonly unknown[];
-            shadowedTokenCount: number;
-        } | null>;
+    commands: {
+        execute(agent: IdleAgent, line: string, attachments: readonly never[], signal: AbortSignal): Promise<{
+            result: {
+                kind: 'success' | 'error';
+                text?: string;
+            };
+        } | undefined>;
     };
     logger: Log;
     on(event: 'agent/created', handler: (payload: {
@@ -129,7 +135,7 @@ export interface PluginContext {
 }
 /**
  * Watch every agent's lifecycle and compact it after its configured idle time.
- * @param ctx - plugin context; `ctx.compaction` must be mounted.
+ * @param ctx - plugin context; `ctx.commands` must be mounted.
  * @param config - rules table from the plugin config.
  * @param timers - timer seam, replaced only by tests.
  */

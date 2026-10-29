@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import {
   apply,
   IdleCompactor,
+  inject,
   resolveIdleMinutes,
   routeOf,
   validateRules,
@@ -214,18 +215,23 @@ describe('IdleCompactor', () => {
 })
 
 describe('apply', () => {
-  function fakeCtx() {
+  type Execution = { result: { kind: 'success' | 'error'; text?: string } } | undefined
+
+  function fakeCtx(outcome: Execution | Error | 'missing' = { result: { kind: 'success', text: 'Compacted 3 history items (~900 tokens).' } }) {
     const handlers = new Map<string, (payload: never) => unknown>()
     const disposers: Array<() => unknown> = []
-    const compacted: IdleAgent[] = []
+    const executed: Array<{ agent: IdleAgent; line: string; attachments: readonly unknown[] }> = []
+    const infos: string[] = []
+    const warnings: string[] = []
     const ctx = {
-      compaction: {
-        compactNow: async (agent: IdleAgent) => {
-          compacted.push(agent)
-          return null
+      commands: {
+        execute: async (agent: IdleAgent, line: string, attachments: readonly unknown[]) => {
+          executed.push({ agent, line, attachments })
+          if (outcome instanceof Error) throw outcome
+          return outcome === 'missing' ? undefined : outcome
         },
       },
-      logger: { info: () => {}, warn: () => {} },
+      logger: { info: (m: string) => infos.push(m), warn: (m: string) => warnings.push(m) },
       on(event: string, handler: (payload: never) => unknown) {
         handlers.set(event, handler)
         return () => handlers.delete(event)
@@ -238,8 +244,20 @@ describe('apply', () => {
       },
     }
     const emit = (event: string, payload: unknown) => handlers.get(event)?.(payload as never)
-    return { ctx, emit, disposers, compacted, handlers }
+    return { ctx, emit, disposers, executed, infos, warnings, handlers }
   }
+
+  async function fireIdle(ctx: ReturnType<typeof fakeCtx>['ctx'], emit: ReturnType<typeof fakeCtx>['emit']) {
+    const timers = fakeTimers()
+    apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
+    emit('agent/status', { agent: fakeAgent(), status: 'idle' })
+    timers.fireAll()
+    await settle()
+  }
+
+  it('injects the commands service, which every composed profile mounts at root', () => {
+    assert.deepEqual(inject, ['commands'])
+  })
 
   it('rejects an invalid rule table at load', () => {
     const { ctx } = fakeCtx()
@@ -267,15 +285,42 @@ describe('apply', () => {
     assert.equal(timers.pending.size, 0)
   })
 
-  it('compacts through ctx.compaction.compactNow when the idle timer fires', async () => {
-    const { ctx, emit, compacted } = fakeCtx()
+  it('runs the /compact command against the agent when the idle timer fires', async () => {
+    const { ctx, emit, executed, infos } = fakeCtx()
     const timers = fakeTimers()
     apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
     const agent = fakeAgent()
     emit('agent/status', { agent, status: 'idle' })
     timers.fireAll()
     await settle()
-    assert.deepEqual(compacted, [agent])
+    assert.deepEqual(executed, [{ agent, line: '/compact', attachments: [] }])
+    assert.match(infos.join('\n'), /Compacted 3 history items/)
+  })
+
+  it('warns when the command settles as an error', async () => {
+    const { ctx, emit, warnings } = fakeCtx({ result: { kind: 'error', text: 'Compaction could not produce a useful summary.' } })
+    await fireIdle(ctx, emit)
+    assert.match(warnings.join('\n'), /could not produce a useful summary/)
+  })
+
+  it('skips quietly when compaction is unavailable because one is running or the agent is busy', async () => {
+    const { ctx, emit, warnings } = fakeCtx({
+      result: { kind: 'error', text: 'Compaction is unavailable because this process has an active compaction, or the agent is not idle.' },
+    })
+    await fireIdle(ctx, emit)
+    assert.deepEqual(warnings, [])
+  })
+
+  it('warns when no /compact command is registered for the agent', async () => {
+    const { ctx, emit, warnings } = fakeCtx('missing')
+    await fireIdle(ctx, emit)
+    assert.match(warnings.join('\n'), /\/compact/)
+  })
+
+  it('logs and swallows a thrown command failure', async () => {
+    const { ctx, emit, warnings } = fakeCtx(new Error('boom'))
+    await fireIdle(ctx, emit)
+    assert.match(warnings.join('\n'), /boom/)
   })
 
   it('clears timers on plugin unload', () => {
