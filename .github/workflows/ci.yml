@@ -33,6 +33,8 @@ jobs:
           node-version: 24
       # Hermetic CLI install; native builds are the set pnpm gates, approved explicitly.
       - run: mkdir -p /tmp/dsh-cli && cd /tmp/dsh-cli && pnpm init -y > /dev/null && pnpm add @deepseek-ai/dsh@0.2.1-rc.2 --allow-build @deepseek-ai/dsh-subprocess-local --allow-build @google/genai --allow-build koffi --allow-build node-pty --allow-build protobufjs
-      - run: $DSH plugin --profile ci-autocompact add .
+      # Tarball installs only see `files`-whitelisted content, like a published install.
+      - run: pnpm pack --pack-destination /tmp/autocompact-pkg
+      - run: $DSH plugin --profile ci-autocompact add /tmp/autocompact-pkg/*.tgz
       - run: $DSH --profile ci-autocompact --dump-config | tee /tmp/config.txt | grep idle-autocompact
       - run: $DSH --profile ci-autocompact --dump-config-schema | tee /tmp/schema.json | grep minutes
