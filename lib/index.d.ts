@@ -6,7 +6,8 @@
  * when a provider's prompt cache expires after a quiet period: the next turn
  * then starts from a short summary instead of re-reading a long cold history.
  *
- * Rules live in the plugin config (Settings -> Plugins) and match a route by
+ * Rules live in the plugin config (Plugins -> dsh-autocompact -> idle-autocompact)
+ * and match a route by
  * provider, model, or both. The most specific match wins:
  * `provider+model` > `model` > `provider`. `minutes: 0` disables a route that
  * a broader rule would otherwise cover. Unmatched routes are never compacted.
@@ -31,11 +32,18 @@ export interface Rule {
     /** Idle minutes before compaction; 0 disables the matched route. */
     minutes: number;
 }
-/** Plugin config: the rules table edited in the Settings UI. */
+/** A rules table, or a live volatile reference to one (what the loader hands a `.volatile()` field). */
+export type RulesSource = Rule[] | {
+    get(): Rule[];
+};
+/** Plugin config: the rules table edited on the Plugins page. */
 export interface Config {
-    rules?: Rule[];
+    rules?: RulesSource;
 }
-/** Config schema surfaced by the Settings -> Plugins page. */
+/**
+ * Config schema. `rules` is volatile: the host exposes volatile fields to the
+ * Plugins page form and applies edits without remounting the plugin.
+ */
 export declare const Config: z<Config>;
 /** Provider/model pair a session last talked to. */
 export interface Route {
@@ -90,7 +98,8 @@ export interface Log {
 }
 /** Dependencies of {@link IdleCompactor}. */
 export interface IdleCompactorDeps<A extends IdleAgent> {
-    rules: readonly Rule[];
+    /** Current rules; read on every arm so live edits apply to the next idle period. */
+    rules(): readonly Rule[];
     compact(agent: A, signal: AbortSignal): Promise<unknown>;
     log: Log;
     timers?: Timers;
@@ -98,6 +107,8 @@ export interface IdleCompactorDeps<A extends IdleAgent> {
 /** One idle timer per agent; fires one compaction per idle period. */
 export declare class IdleCompactor<A extends IdleAgent> {
     private readonly handles;
+    /** Agents inside an idle period that has not compacted yet. */
+    private readonly idle;
     private readonly inflight;
     private readonly timers;
     private readonly deps;
@@ -106,6 +117,10 @@ export declare class IdleCompactor<A extends IdleAgent> {
     arm(agent: A): void;
     /** Cancel the countdown (agent got busy or was disposed). */
     disarm(agent: A): void;
+    /** Restart the countdown of every agent still in an uncompacted idle period, after the rules changed. */
+    refresh(): void;
+    private schedule;
+    private clearTimer;
     /** Clear every countdown and abort compactions still running. */
     dispose(): void;
     private fire;
@@ -131,6 +146,7 @@ export interface PluginContext {
     on(event: 'agent/disposed', handler: (payload: {
         agent: IdleAgent;
     }) => void): unknown;
+    on(event: 'loader/volatile-update', handler: (paths: readonly (readonly string[])[]) => void): unknown;
     effect(factory: () => Generator<() => unknown>, name?: string): unknown;
 }
 /**
