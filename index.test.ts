@@ -217,7 +217,7 @@ describe('IdleCompactor', () => {
 describe('apply', () => {
   type Execution = { result: { kind: 'success' | 'error'; text?: string } } | undefined
 
-  function fakeCtx(outcome: Execution | Error = { result: { kind: 'success', text: 'Compacted 3 history items (~900 tokens).' } }) {
+  function fakeCtx(outcome: Execution | Error | 'missing' = { result: { kind: 'success', text: 'Compacted 3 history items (~900 tokens).' } }) {
     const handlers = new Map<string, (payload: never) => unknown>()
     const disposers: Array<() => unknown> = []
     const executed: Array<{ agent: IdleAgent; line: string; attachments: readonly unknown[] }> = []
@@ -228,7 +228,7 @@ describe('apply', () => {
         execute: async (agent: IdleAgent, line: string, attachments: readonly unknown[]) => {
           executed.push({ agent, line, attachments })
           if (outcome instanceof Error) throw outcome
-          return outcome
+          return outcome === 'missing' ? undefined : outcome
         },
       },
       logger: { info: (m: string) => infos.push(m), warn: (m: string) => warnings.push(m) },
@@ -312,7 +312,7 @@ describe('apply', () => {
   })
 
   it('warns when no /compact command is registered for the agent', async () => {
-    const { ctx, emit, warnings } = fakeCtx(undefined)
+    const { ctx, emit, warnings } = fakeCtx('missing')
     await fireIdle(ctx, emit)
     assert.match(warnings.join('\n'), /\/compact/)
   })
