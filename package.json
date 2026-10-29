@@ -1,7 +1,7 @@
 {
   "name": "dsh-autocompact",
-  "version": "0.1.0",
-  "description": "Idle autocompact for DeepSeek Harness: compact a session after N idle minutes, configured per model or provider",
+  "version": "0.2.0",
+  "description": "Idle autocompact for DeepSeek Harness: compact a session after N idle minutes, configured per model or provider on the Plugins page",
   "keywords": [
     "deepseek-harness",
     "dsh-plugin",
@@ -16,18 +16,20 @@
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client/client.js"
   },
   "files": [
     "lib/index.js",
     "lib/index.d.ts",
+    "client/client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --experimental-strip-types --test index.test.ts"
+    "test": "node --experimental-strip-types --test index.test.ts client.test.ts"
   },
   "repository": {
     "type": "git",
@@ -36,6 +38,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
     }
   },
   "packageManager": "pnpm@12.4.2",

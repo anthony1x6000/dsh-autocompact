@@ -1,7 +1,7 @@
 # Idle autocompact bundle: compacts a session after N idle minutes, N chosen
 # per model route. Install:
 #   dsh plugin --profile web add "github:anthony1x6000/dsh-autocompact#main"
-# With no rules nothing is compacted; add rows under Settings -> Plugins, or here:
+# With no rules nothing is compacted; add rows on the Plugins page (Configure on the idle-autocompact row), or here:
 #   rules:
 #     - provider: deepseek        # provider only: any model on this provider
 #       minutes: 10

@@ -6,7 +6,8 @@
  * when a provider's prompt cache expires after a quiet period: the next turn
  * then starts from a short summary instead of re-reading a long cold history.
  *
- * Rules live in the plugin config (Settings -> Plugins) and match a route by
+ * Rules live in the plugin config (Plugins -> dsh-autocompact -> idle-autocompact)
+ * and match a route by
  * provider, model, or both. The most specific match wins:
  * `provider+model` > `model` > `provider`. `minutes: 0` disables a route that
  * a broader rule would otherwise cover. Unmatched routes are never compacted.
@@ -40,9 +41,17 @@ export interface Rule {
   minutes: number
 }
 
-/** Plugin config: the rules table edited in the Settings UI. */
+/** A rules table, or a live volatile reference to one (what the loader hands a `.volatile()` field). */
+export type RulesSource = Rule[] | { get(): Rule[] }
+
+/** Plugin config: the rules table edited on the Plugins page. */
 export interface Config {
-  rules?: Rule[]
+  rules?: RulesSource
+}
+
+function readRules(source: RulesSource | undefined): Rule[] {
+  if (source === undefined) return []
+  return Array.isArray(source) ? source : source.get()
 }
 
 const ruleSchema = z.object({
@@ -51,12 +60,15 @@ const ruleSchema = z.object({
   minutes: z.number().min(0).required().description('Idle minutes before compaction; 0 disables.'),
 })
 
-/** Config schema surfaced by the Settings -> Plugins page. */
-export const Config: z<Config> = z.object({
-  rules: z.array(ruleSchema).description(
+/**
+ * Config schema. `rules` is volatile: the host exposes volatile fields to the
+ * Plugins page form and applies edits without remounting the plugin.
+ */
+export const Config = z.object({
+  rules: z.array(ruleSchema).default([]).volatile().description(
     'Idle autocompact rules. Most specific wins: provider+model > model > provider.',
   ),
-})
+}) as unknown as z<Config>
 
 /** Provider/model pair a session last talked to. */
 export interface Route {
@@ -157,7 +169,8 @@ export interface Log {
 
 /** Dependencies of {@link IdleCompactor}. */
 export interface IdleCompactorDeps<A extends IdleAgent> {
-  rules: readonly Rule[]
+  /** Current rules; read on every arm so live edits apply to the next idle period. */
+  rules(): readonly Rule[]
   compact(agent: A, signal: AbortSignal): Promise<unknown>
   log: Log
   timers?: Timers
@@ -166,6 +179,8 @@ export interface IdleCompactorDeps<A extends IdleAgent> {
 /** One idle timer per agent; fires one compaction per idle period. */
 export class IdleCompactor<A extends IdleAgent> {
   private readonly handles = new Map<A, unknown>()
+  /** Agents inside an idle period that has not compacted yet. */
+  private readonly idle = new Set<A>()
   private readonly inflight = new Set<AbortController>()
   private readonly timers: Timers
   private readonly deps: IdleCompactorDeps<A>
@@ -178,13 +193,31 @@ export class IdleCompactor<A extends IdleAgent> {
   /** Start (or restart) the idle countdown for an agent that just became idle. */
   arm(agent: A): void {
     this.disarm(agent)
-    const minutes = resolveIdleMinutes(this.deps.rules, routeOf(agent))
-    if (minutes === undefined) return
-    this.handles.set(agent, this.timers.set(() => void this.fire(agent), minutes * MINUTE_MS))
+    this.idle.add(agent)
+    this.schedule(agent)
   }
 
   /** Cancel the countdown (agent got busy or was disposed). */
   disarm(agent: A): void {
+    this.idle.delete(agent)
+    this.clearTimer(agent)
+  }
+
+  /** Restart the countdown of every agent still in an uncompacted idle period, after the rules changed. */
+  refresh(): void {
+    for (const agent of this.idle) {
+      this.clearTimer(agent)
+      this.schedule(agent)
+    }
+  }
+
+  private schedule(agent: A): void {
+    const minutes = resolveIdleMinutes(this.deps.rules(), routeOf(agent))
+    if (minutes === undefined) return
+    this.handles.set(agent, this.timers.set(() => void this.fire(agent), minutes * MINUTE_MS))
+  }
+
+  private clearTimer(agent: A): void {
     const handle = this.handles.get(agent)
     if (handle === undefined) return
     this.timers.clear(handle)
@@ -195,12 +228,14 @@ export class IdleCompactor<A extends IdleAgent> {
   dispose(): void {
     for (const handle of this.handles.values()) this.timers.clear(handle)
     this.handles.clear()
+    this.idle.clear()
     for (const controller of this.inflight) controller.abort()
     this.inflight.clear()
   }
 
   private async fire(agent: A): Promise<void> {
     this.handles.delete(agent)
+    this.idle.delete(agent)
     if (agent.status !== 'idle') return
     const controller = new AbortController()
     this.inflight.add(controller)
@@ -230,6 +265,7 @@ export interface PluginContext {
   on(event: 'agent/created', handler: (payload: { agent: IdleAgent }) => void): unknown
   on(event: 'agent/status', handler: (payload: { agent: IdleAgent; status: 'idle' | 'running' }) => void): unknown
   on(event: 'agent/disposed', handler: (payload: { agent: IdleAgent }) => void): unknown
+  on(event: 'loader/volatile-update', handler: (paths: readonly (readonly string[])[]) => void): unknown
   effect(factory: () => Generator<() => unknown>, name?: string): unknown
 }
 
@@ -240,8 +276,9 @@ export interface PluginContext {
  * @param timers - timer seam, replaced only by tests.
  */
 export function apply(ctx: PluginContext, config: Config = {}, timers?: Timers): void {
-  const rules = config.rules ?? []
-  validateRules(rules)
+  validateRules(readRules(config.rules))
+  let rulesValid = true
+  const rules = (): Rule[] => rulesValid ? readRules(config.rules) : []
   const compactor = new IdleCompactor<IdleAgent>({
     rules,
     ...timers !== undefined ? { timers } : {},
@@ -263,6 +300,16 @@ export function apply(ctx: PluginContext, config: Config = {}, timers?: Timers):
     else compactor.disarm(agent)
   })
   ctx.on('agent/disposed', ({ agent }) => compactor.disarm(agent))
+  ctx.on('loader/volatile-update', () => {
+    try {
+      validateRules(readRules(config.rules))
+      rulesValid = true
+    } catch (error: unknown) {
+      rulesValid = false
+      ctx.logger.warn(`idle compaction rules ignored: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    compactor.refresh()
+  })
   ctx.effect(function* () {
     yield () => compactor.dispose()
   }, 'idle-autocompact lifecycle')
