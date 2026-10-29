@@ -20,10 +20,12 @@ inside each agent preset.
 ## Configure
 
 Open **Plugins** in the sidebar, then **dsh-autocompact** under *Installed plugins*,
-and click **Configure** on the `idle-autocompact` row. Add rows of provider, model
-and idle minutes, then **Save**. Saving applies to running sessions without a
-restart. (**Settings -> Built-in plugins** is a read-only inventory and has no
-form for this plugin.)
+and click **Configure** on the `idle-autocompact` row. Pick a provider and model
+from the deployment's current catalog (or **Any provider** / **Any model**), set
+the idle minutes, then **Save**. A saved value the catalog no longer offers stays
+selectable and is marked *unavailable*, so saving another row never rewrites it.
+Saving applies to running sessions without a restart. (**Settings -> Built-in
+plugins** is a read-only inventory and has no form for this plugin.)
 
 Or set it in your profile patch:
 
