@@ -59,6 +59,10 @@ with neither `provider` nor `model`, and negative minutes fail at load.
   agent's configured model before the first request.
 - One compaction per idle period; it does not repeat until the session has been
   active again.
+- Every compaction (manual `/compact`, idle, or automatic) logs how much of the
+  summarization request was read from the provider's prompt cache, e.g.
+  `compaction cache: 98% of input read from cache (read 11760, write 0, uncached 240, total 12000)`.
+  A high read share means the history was warm; near 0% means it was re-read cold.
 - If compaction is already running, or the agent became busy, the attempt is
   skipped silently. Other failures are logged as warnings and never crash a turn.
 
