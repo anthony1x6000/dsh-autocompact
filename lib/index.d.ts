@@ -6,6 +6,9 @@
  * when a provider's prompt cache expires after a quiet period: the next turn
  * then starts from a short summary instead of re-reading a long cold history.
  *
+ * Every compaction (manual, idle or automatic) also logs how much of the
+ * summarization request was read from the provider's prompt cache.
+ *
  * Rules live in the plugin config (Plugins -> dsh-autocompact -> idle-autocompact)
  * and match a route by
  * provider, model, or both. The most specific match wins:
@@ -91,6 +94,18 @@ export declare function resolveIdleMinutes(rules: readonly Rule[], route: Route)
  * @returns provider/model, either possibly undefined.
  */
 export declare function routeOf(agent: IdleAgent): Route;
+/** The slice of the harness `TokenUsage`: counts are disjoint, so total input = uncached + read + write. */
+export interface CacheUsage {
+    inputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+}
+/**
+ * Describe how much of a compaction request was served from the provider's prompt cache.
+ * @param usage - usage the summarization call reported, if any.
+ * @returns a one-line summary with the cache-read share and the raw counts.
+ */
+export declare function formatCacheUsage(usage: CacheUsage | undefined): string;
 /** Logger subset used for diagnostics. */
 export interface Log {
     info(message: string): void;
@@ -145,6 +160,12 @@ export interface PluginContext {
     }) => void): unknown;
     on(event: 'agent/disposed', handler: (payload: {
         agent: IdleAgent;
+    }) => void): unknown;
+    on(event: 'session/event', handler: (session: unknown, event: {
+        type: string;
+        data: {
+            usage?: CacheUsage;
+        };
     }) => void): unknown;
     on(event: 'loader/volatile-update', handler: (paths: readonly (readonly string[])[]) => void): unknown;
     effect(factory: () => Generator<() => unknown>, name?: string): unknown;

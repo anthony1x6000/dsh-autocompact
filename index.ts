@@ -6,6 +6,9 @@
  * when a provider's prompt cache expires after a quiet period: the next turn
  * then starts from a short summary instead of re-reading a long cold history.
  *
+ * Every compaction (manual, idle or automatic) also logs how much of the
+ * summarization request was read from the provider's prompt cache.
+ *
  * Rules live in the plugin config (Plugins -> dsh-autocompact -> idle-autocompact)
  * and match a route by
  * provider, model, or both. The most specific match wins:
@@ -161,6 +164,27 @@ export function routeOf(agent: IdleAgent): Route {
     : { provider: agent.options.provider, model: agent.options.model }
 }
 
+/** The slice of the harness `TokenUsage`: counts are disjoint, so total input = uncached + read + write. */
+export interface CacheUsage {
+  inputTokens: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+}
+
+/**
+ * Describe how much of a compaction request was served from the provider's prompt cache.
+ * @param usage - usage the summarization call reported, if any.
+ * @returns a one-line summary with the cache-read share and the raw counts.
+ */
+export function formatCacheUsage(usage: CacheUsage | undefined): string {
+  if (usage === undefined) return 'usage not reported by provider'
+  const read = usage.cacheReadTokens ?? 0
+  const write = usage.cacheWriteTokens ?? 0
+  const total = usage.inputTokens + read + write
+  const percent = total === 0 ? 0 : Math.round(read / total * 100)
+  return `${percent}% of input read from cache (read ${read}, write ${write}, uncached ${usage.inputTokens}, total ${total})`
+}
+
 /** Logger subset used for diagnostics. */
 export interface Log {
   info(message: string): void
@@ -265,6 +289,10 @@ export interface PluginContext {
   on(event: 'agent/created', handler: (payload: { agent: IdleAgent }) => void): unknown
   on(event: 'agent/status', handler: (payload: { agent: IdleAgent; status: 'idle' | 'running' }) => void): unknown
   on(event: 'agent/disposed', handler: (payload: { agent: IdleAgent }) => void): unknown
+  on(
+    event: 'session/event',
+    handler: (session: unknown, event: { type: string; data: { usage?: CacheUsage } }) => void,
+  ): unknown
   on(event: 'loader/volatile-update', handler: (paths: readonly (readonly string[])[]) => void): unknown
   effect(factory: () => Generator<() => unknown>, name?: string): unknown
 }
@@ -300,6 +328,9 @@ export function apply(ctx: PluginContext, config: Config = {}, timers?: Timers):
     else compactor.disarm(agent)
   })
   ctx.on('agent/disposed', ({ agent }) => compactor.disarm(agent))
+  ctx.on('session/event', (_session, event) => {
+    if (event.type === 'compaction/summary') ctx.logger.info(`compaction cache: ${formatCacheUsage(event.data.usage)}`)
+  })
   ctx.on('loader/volatile-update', () => {
     try {
       validateRules(readRules(config.rules))

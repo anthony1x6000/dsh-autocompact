@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import {
   apply,
   Config,
+  formatCacheUsage,
   IdleCompactor,
   inject,
   resolveIdleMinutes,
@@ -267,11 +268,42 @@ describe('IdleCompactor', () => {
   })
 })
 
+describe('formatCacheUsage', () => {
+  it('reports a warm read when the whole history came from cache', () => {
+    assert.equal(
+      formatCacheUsage({ inputTokens: 240, outputTokens: 500, cacheReadTokens: 11_760, cacheWriteTokens: 0 }),
+      '98% of input read from cache (read 11760, write 0, uncached 240, total 12000)',
+    )
+  })
+
+  it('reports 0% when the provider reports no cache hit', () => {
+    assert.equal(
+      formatCacheUsage({ inputTokens: 5000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 5000 }),
+      '0% of input read from cache (read 0, write 5000, uncached 5000, total 10000)',
+    )
+  })
+
+  it('treats missing cache fields as zero', () => {
+    assert.equal(
+      formatCacheUsage({ inputTokens: 800, outputTokens: 50 }),
+      '0% of input read from cache (read 0, write 0, uncached 800, total 800)',
+    )
+  })
+
+  it('says so when the provider emitted no usage', () => {
+    assert.equal(formatCacheUsage(undefined), 'usage not reported by provider')
+  })
+
+  it('does not divide by zero on an empty request', () => {
+    assert.equal(formatCacheUsage({ inputTokens: 0, outputTokens: 0 }), '0% of input read from cache (read 0, write 0, uncached 0, total 0)')
+  })
+})
+
 describe('apply', () => {
   type Execution = { result: { kind: 'success' | 'error'; text?: string } } | undefined
 
   function fakeCtx(outcome: Execution | Error | 'missing' = { result: { kind: 'success', text: 'Compacted 3 history items (~900 tokens).' } }) {
-    const handlers = new Map<string, (payload: never) => unknown>()
+    const handlers = new Map<string, (...args: never[]) => unknown>()
     const disposers: Array<() => unknown> = []
     const executed: Array<{ agent: IdleAgent; line: string; attachments: readonly unknown[] }> = []
     const infos: string[] = []
@@ -285,7 +317,7 @@ describe('apply', () => {
         },
       },
       logger: { info: (m: string) => infos.push(m), warn: (m: string) => warnings.push(m) },
-      on(event: string, handler: (payload: never) => unknown) {
+      on(event: string, handler: (...args: never[]) => unknown) {
         handlers.set(event, handler)
         return () => handlers.delete(event)
       },
@@ -296,7 +328,7 @@ describe('apply', () => {
         }
       },
     }
-    const emit = (event: string, payload: unknown) => handlers.get(event)?.(payload as never)
+    const emit = (event: string, ...args: unknown[]) => handlers.get(event)?.(...args as never[])
     return { ctx, emit, disposers, executed, infos, warnings, handlers }
   }
 
@@ -431,6 +463,21 @@ describe('apply', () => {
       const { ref } = liveRules([{ minutes: 5 }])
       assert.throws(() => apply(ctx as never, { rules: ref } as never), /provider or model/)
     })
+  })
+
+  it('logs the cache usage of every compaction summary, manual or idle', () => {
+    const { ctx, emit, infos } = fakeCtx()
+    apply(ctx as never)
+    const usage = { inputTokens: 240, outputTokens: 500, cacheReadTokens: 11_760 }
+    emit('session/event', {}, { type: 'compaction/summary', data: { usage } })
+    assert.deepEqual(infos, ['compaction cache: 98% of input read from cache (read 11760, write 0, uncached 240, total 12000)'])
+  })
+
+  it('ignores other session events', () => {
+    const { ctx, emit, infos } = fakeCtx()
+    apply(ctx as never)
+    emit('session/event', {}, { type: 'user/message', data: {} })
+    assert.deepEqual(infos, [])
   })
 })
 
