@@ -19,7 +19,7 @@ function fakeAgent(overrides: Partial<IdleAgent> = {}): IdleAgent {
   return {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { requestHeader: () => undefined },
+    session: { header: { id: 'session-1' }, requestHeader: () => undefined },
     runMaintenance: async (task) => task(new AbortController().signal),
     ...overrides,
   }
@@ -108,7 +108,10 @@ describe('validateRules', () => {
 describe('routeOf', () => {
   it('prefers the latest request header over agent options', () => {
     const agent = fakeAgent({
-      session: { requestHeader: () => ({ config: { provider: 'hdr-p', model: 'hdr-m' } }) },
+      session: {
+        header: { id: 'session-1' },
+        requestHeader: () => ({ config: { provider: 'hdr-p', model: 'hdr-m' } }),
+      },
     })
     assert.deepEqual(routeOf(agent), { provider: 'hdr-p', model: 'hdr-m' })
   })
@@ -185,6 +188,27 @@ describe('IdleCompactor', () => {
     timers.fireAll()
     await settle()
     assert.equal(compacted.length, 0)
+  })
+
+  it('skips compaction when the session is archived at fire time, consuming the idle period', async () => {
+    const timers = fakeTimers()
+    const compacted: IdleAgent[] = []
+    const compactor = new IdleCompactor<IdleAgent>({
+      rules: () => [{ provider: 'deepseek', minutes: 5 }],
+      timers,
+      archived: () => true,
+      compact: async (agent) => {
+        compacted.push(agent)
+        return {}
+      },
+      log: { info: () => {}, warn: () => {} },
+    })
+    const agent = fakeAgent()
+    compactor.arm(agent)
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(compacted, [])
+    assert.equal(timers.pending.size, 0)
   })
 
   it('logs and swallows compaction failures', async () => {
@@ -302,7 +326,10 @@ describe('formatCacheUsage', () => {
 describe('apply', () => {
   type Execution = { result: { kind: 'success' | 'error'; text?: string } } | undefined
 
-  function fakeCtx(outcome: Execution | Error | 'missing' = { result: { kind: 'success', text: 'Compacted 3 history items (~900 tokens).' } }) {
+  function fakeCtx(
+    outcome: Execution | Error | 'missing' = { result: { kind: 'success', text: 'Compacted 3 history items (~900 tokens).' } },
+    workspace?: { archivedSessionIds: string[] },
+  ) {
     const handlers = new Map<string, (...args: never[]) => unknown>()
     const disposers: Array<() => unknown> = []
     const executed: Array<{ agent: IdleAgent; line: string; attachments: readonly unknown[] }> = []
@@ -315,6 +342,9 @@ describe('apply', () => {
           if (outcome instanceof Error) throw outcome
           return outcome === 'missing' ? undefined : outcome
         },
+      },
+      get(name: string) {
+        return name === 'workspaceRegistry' ? workspace : undefined
       },
       logger: { info: (m: string) => infos.push(m), warn: (m: string) => warnings.push(m) },
       on(event: string, handler: (...args: never[]) => unknown) {
@@ -380,6 +410,60 @@ describe('apply', () => {
     await settle()
     assert.deepEqual(executed, [{ agent, line: '/compact', attachments: [] }])
     assert.match(infos.join('\n'), /Compacted 3 history items/)
+  })
+
+  it('does not compact a session in the host archive set', async () => {
+    const { ctx, emit, executed, warnings } = fakeCtx(undefined, { archivedSessionIds: ['session-1'] })
+    const timers = fakeTimers()
+    apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
+    emit('agent/status', { agent: fakeAgent(), status: 'idle' })
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(executed, [])
+    assert.deepEqual(warnings, [])
+  })
+
+  it('compacts a session that is not in the archive set', async () => {
+    const { ctx, emit, executed } = fakeCtx(undefined, { archivedSessionIds: ['another-session'] })
+    const timers = fakeTimers()
+    apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
+    const agent = fakeAgent()
+    emit('agent/status', { agent, status: 'idle' })
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(executed, [{ agent, line: '/compact', attachments: [] }])
+  })
+
+  it('compacts again once the session leaves the archive set and goes idle', async () => {
+    const workspace = { archivedSessionIds: ['session-1'] }
+    const { ctx, emit, executed } = fakeCtx(undefined, workspace)
+    const timers = fakeTimers()
+    apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
+    const agent = fakeAgent()
+    emit('agent/status', { agent, status: 'idle' })
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(executed, [])
+
+    workspace.archivedSessionIds = []
+    agent.status = 'running'
+    emit('agent/status', { agent, status: 'running' })
+    agent.status = 'idle'
+    emit('agent/status', { agent, status: 'idle' })
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(executed, [{ agent, line: '/compact', attachments: [] }])
+  })
+
+  it('compacts normally in a profile that mounts no workspace registry', async () => {
+    const { ctx, emit, executed } = fakeCtx()
+    const timers = fakeTimers()
+    apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
+    const agent = fakeAgent()
+    emit('agent/status', { agent, status: 'idle' })
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(executed, [{ agent, line: '/compact', attachments: [] }])
   })
 
   it('warns when the command settles as an error', async () => {
