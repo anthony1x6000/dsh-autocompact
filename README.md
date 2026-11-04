@@ -59,6 +59,10 @@ with neither `provider` nor `model`, and negative minutes fail at load.
   agent's configured model before the first request.
 - One compaction per idle period; it does not repeat until the session has been
   active again.
+- A session in the host's archive set is never compacted. The set is read when
+  the timer fires, so a thread archived during its countdown is skipped and that
+  idle period is consumed; unarchive it and it compacts again after its next idle
+  period. Profiles without a workspace registry archive nothing and are unaffected.
 - Every compaction (manual `/compact`, idle, or automatic) logs how much of the
   summarization request was read from the provider's prompt cache, e.g.
   `compaction cache: 98% of input read from cache (read 11760, write 0, uncached 240, total 12000)`.

@@ -14,6 +14,7 @@
  * provider, model, or both. The most specific match wins:
  * `provider+model` > `model` > `provider`. `minutes: 0` disables a route that
  * a broader rule would otherwise cover. Unmatched routes are never compacted.
+ * Sessions in the host's archive set are never compacted either.
  *
  * @module dsh-autocompact
  */
@@ -83,7 +84,11 @@ export interface Route {
 export interface IdleAgent {
   status: 'idle' | 'running'
   options: { provider?: string; model?: string }
-  session: { requestHeader(): { config: { provider: string; model: string } } | undefined }
+  session: {
+    /** Durable session identity; the host archive set is keyed by `header.id`. */
+    header: { id: string }
+    requestHeader(): { config: { provider: string; model: string } } | undefined
+  }
   runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>
 }
 
@@ -196,6 +201,11 @@ export interface IdleCompactorDeps<A extends IdleAgent> {
   /** Current rules; read on every arm so live edits apply to the next idle period. */
   rules(): readonly Rule[]
   compact(agent: A, signal: AbortSignal): Promise<unknown>
+  /**
+   * Whether the agent's session is archived. Archived sessions are skipped at
+   * fire time, and their idle period is consumed like any other skipped fire.
+   */
+  archived?(agent: A): boolean
   log: Log
   timers?: Timers
 }
@@ -261,6 +271,7 @@ export class IdleCompactor<A extends IdleAgent> {
     this.handles.delete(agent)
     this.idle.delete(agent)
     if (agent.status !== 'idle') return
+    if (this.deps.archived?.(agent) === true) return
     const controller = new AbortController()
     this.inflight.add(controller)
     try {
@@ -275,6 +286,12 @@ export class IdleCompactor<A extends IdleAgent> {
   }
 }
 
+/** The slice of the host `WorkspaceRegistry` this plugin reads. */
+export interface WorkspaceArchive {
+  /** Sessions in the registry-global archive set, hidden from every grouping surface. */
+  readonly archivedSessionIds: readonly string[]
+}
+
 /** Minimal Cordis context surface this plugin touches. */
 export interface PluginContext {
   commands: {
@@ -285,6 +302,11 @@ export interface PluginContext {
       signal: AbortSignal,
     ): Promise<{ result: { kind: 'success' | 'error'; text?: string } } | undefined>
   }
+  /**
+   * Service lookup. The workspace registry is optional: a profile that mounts
+   * none archives nothing, so every session there stays compactable.
+   */
+  get(name: 'workspaceRegistry'): WorkspaceArchive | undefined
   logger: Log
   on(event: 'agent/created', handler: (payload: { agent: IdleAgent }) => void): unknown
   on(event: 'agent/status', handler: (payload: { agent: IdleAgent; status: 'idle' | 'running' }) => void): unknown
@@ -295,6 +317,22 @@ export interface PluginContext {
   ): unknown
   on(event: 'loader/volatile-update', handler: (paths: readonly (readonly string[])[]) => void): unknown
   effect(factory: () => Generator<() => unknown>, name?: string): unknown
+}
+
+/**
+ * The host's archive set, read fresh on every fire so an archive or unarchive
+ * during the countdown is honored. Read defensively: a timer fires without an
+ * awaiter, and a registry that is not started yet (or a profile with no
+ * registry at all) must not turn an idle tick into a process-killing rejection.
+ * @param ctx - plugin context.
+ * @returns the archived session ids; empty when nothing is archived or readable.
+ */
+function archivedSessionIds(ctx: PluginContext): readonly string[] {
+  try {
+    return ctx.get('workspaceRegistry')?.archivedSessionIds ?? []
+  } catch {
+    return []
+  }
 }
 
 /**
@@ -311,6 +349,7 @@ export function apply(ctx: PluginContext, config: Config = {}, timers?: Timers):
     rules,
     ...timers !== undefined ? { timers } : {},
     log: ctx.logger,
+    archived: (agent) => archivedSessionIds(ctx).includes(agent.session.header.id),
     async compact(agent, signal) {
       const execution = await ctx.commands.execute(agent, '/compact', [], signal)
       if (execution === undefined) throw new Error('no /compact command is registered for this agent')
