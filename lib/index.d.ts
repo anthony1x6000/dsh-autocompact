@@ -14,6 +14,7 @@
  * provider, model, or both. The most specific match wins:
  * `provider+model` > `model` > `provider`. `minutes: 0` disables a route that
  * a broader rule would otherwise cover. Unmatched routes are never compacted.
+ * Sessions in the host's archive set are never compacted either.
  *
  * @module dsh-autocompact
  */
@@ -61,6 +62,10 @@ export interface IdleAgent {
         model?: string;
     };
     session: {
+        /** Durable session identity; the host archive set is keyed by `header.id`. */
+        header: {
+            id: string;
+        };
         requestHeader(): {
             config: {
                 provider: string;
@@ -116,6 +121,11 @@ export interface IdleCompactorDeps<A extends IdleAgent> {
     /** Current rules; read on every arm so live edits apply to the next idle period. */
     rules(): readonly Rule[];
     compact(agent: A, signal: AbortSignal): Promise<unknown>;
+    /**
+     * Whether the agent's session is archived. Archived sessions are skipped at
+     * fire time, and their idle period is consumed like any other skipped fire.
+     */
+    archived?(agent: A): boolean;
     log: Log;
     timers?: Timers;
 }
@@ -140,6 +150,11 @@ export declare class IdleCompactor<A extends IdleAgent> {
     dispose(): void;
     private fire;
 }
+/** The slice of the host `WorkspaceRegistry` this plugin reads. */
+export interface WorkspaceArchive {
+    /** Sessions in the registry-global archive set, hidden from every grouping surface. */
+    readonly archivedSessionIds: readonly string[];
+}
 /** Minimal Cordis context surface this plugin touches. */
 export interface PluginContext {
     commands: {
@@ -150,6 +165,11 @@ export interface PluginContext {
             };
         } | undefined>;
     };
+    /**
+     * Service lookup. The workspace registry is optional: a profile that mounts
+     * none archives nothing, so every session there stays compactable.
+     */
+    get(name: 'workspaceRegistry'): WorkspaceArchive | undefined;
     logger: Log;
     on(event: 'agent/created', handler: (payload: {
         agent: IdleAgent;
