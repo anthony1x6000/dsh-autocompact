@@ -4,6 +4,7 @@ import {
   apply,
   Config,
   formatCacheUsage,
+  historyEndsWithCompaction,
   IdleCompactor,
   inject,
   resolveIdleMinutes,
@@ -19,7 +20,12 @@ function fakeAgent(overrides: Partial<IdleAgent> = {}): IdleAgent {
   return {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { header: { id: 'session-1' }, requestHeader: () => undefined },
+    session: {
+      header: { id: 'session-1' },
+      seq: 0,
+      eventAt: () => undefined,
+      requestHeader: () => undefined,
+    },
     runMaintenance: async (task) => task(new AbortController().signal),
     ...overrides,
   }
@@ -211,6 +217,50 @@ describe('IdleCompactor', () => {
     assert.equal(timers.pending.size, 0)
   })
 
+  it('skips compaction when the history already ends with one, consuming the idle period', async () => {
+    const timers = fakeTimers()
+    const compacted: IdleAgent[] = []
+    const compactor = new IdleCompactor<IdleAgent>({
+      rules: () => [{ provider: 'deepseek', minutes: 5 }],
+      timers,
+      compacted: () => true,
+      compact: async (agent) => {
+        compacted.push(agent)
+        return {}
+      },
+      log: { info: () => {}, warn: () => {} },
+    })
+    const agent = fakeAgent()
+    compactor.arm(agent)
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(compacted, [])
+    compactor.refresh()
+    assert.equal(timers.pending.size, 0)
+  })
+
+  it('reads the already-compacted state at fire time, not at arm time', async () => {
+    let compactedNow = false
+    const timers = fakeTimers()
+    const compacted: IdleAgent[] = []
+    const compactor = new IdleCompactor<IdleAgent>({
+      rules: () => [{ provider: 'deepseek', minutes: 5 }],
+      timers,
+      compacted: () => compactedNow,
+      compact: async (agent) => {
+        compacted.push(agent)
+        return {}
+      },
+      log: { info: () => {}, warn: () => {} },
+    })
+    const agent = fakeAgent()
+    compactor.arm(agent)
+    compactedNow = true
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(compacted, [])
+  })
+
   it('logs and swallows compaction failures', async () => {
     const { timers, warnings, compactor } = setup([{ provider: 'deepseek', minutes: 5 }], async () => {
       throw new Error('boom')
@@ -320,6 +370,84 @@ describe('formatCacheUsage', () => {
 
   it('does not divide by zero on an empty request', () => {
     assert.equal(formatCacheUsage({ inputTokens: 0, outputTokens: 0 }), '0% of input read from cache (read 0, write 0, uncached 0, total 0)')
+  })
+})
+
+describe('historyEndsWithCompaction', () => {
+  type Event = { type: string; data?: { error?: string } }
+
+  /** A session-log stub with one event per seq, counting every read. */
+  function fakeLog(events: Event[]) {
+    const reads: number[] = []
+    return {
+      reads,
+      log: {
+        seq: events.length,
+        eventAt(seq: number): Event | undefined {
+          reads.push(seq)
+          return events[seq]
+        },
+      },
+    }
+  }
+
+  const turnEnd: Event = { type: 'turn/end' }
+  const turnStart: Event = { type: 'turn/start' }
+
+  it('is true when the newest history is a compaction, command noise included', () => {
+    const { log } = fakeLog([
+      turnEnd,
+      { type: 'command/run' },
+      { type: 'compaction/start' },
+      { type: 'compaction/summary' },
+      { type: 'user/message' },
+      { type: 'compaction/end' },
+      { type: 'command/done' },
+    ])
+    assert.equal(historyEndsWithCompaction(log), true)
+  })
+
+  it('is false once a turn has closed after the compaction', () => {
+    const { log } = fakeLog([
+      { type: 'compaction/end' },
+      { type: 'command/done' },
+      turnStart,
+      { type: 'user/message' },
+      { type: 'assistant/message' },
+      turnEnd,
+    ])
+    assert.equal(historyEndsWithCompaction(log), false)
+  })
+
+  it('is false for a failed compaction, which leaves the history unchanged', () => {
+    const { log } = fakeLog([
+      turnEnd,
+      { type: 'command/run' },
+      { type: 'compaction/start' },
+      { type: 'compaction/end', data: { error: 'summary failed' } },
+      { type: 'command/done' },
+    ])
+    assert.equal(historyEndsWithCompaction(log), false)
+  })
+
+  it('is false while a compaction is still in flight', () => {
+    const { log } = fakeLog([turnEnd, { type: 'command/run' }, { type: 'compaction/start' }])
+    assert.equal(historyEndsWithCompaction(log), false)
+  })
+
+  it('is false for a session that never compacted', () => {
+    assert.equal(historyEndsWithCompaction(fakeLog([]).log), false)
+    assert.equal(historyEndsWithCompaction(fakeLog([turnEnd]).log), false)
+  })
+
+  it('stops at the newest deciding event instead of scanning the log', () => {
+    const fresh = fakeLog([turnStart, { type: 'user/message' }, turnEnd])
+    assert.equal(historyEndsWithCompaction(fresh.log), false)
+    assert.deepEqual(fresh.reads, [2])
+
+    const compacted = fakeLog([turnEnd, { type: 'compaction/end' }])
+    assert.equal(historyEndsWithCompaction(compacted.log), true)
+    assert.deepEqual(compacted.reads, [1])
   })
 })
 
@@ -460,6 +588,39 @@ describe('apply', () => {
     const timers = fakeTimers()
     apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
     const agent = fakeAgent()
+    emit('agent/status', { agent, status: 'idle' })
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(executed, [{ agent, line: '/compact', attachments: [] }])
+  })
+
+  function agentWithLog(events: Array<{ type: string; data?: { error?: string } }>): IdleAgent {
+    return fakeAgent({
+      session: {
+        header: { id: 'session-1' },
+        seq: events.length,
+        eventAt: (seq: number) => events[seq],
+        requestHeader: () => undefined,
+      },
+    })
+  }
+
+  it('does not autocompact a session whose newest history is a compaction', async () => {
+    const { ctx, emit, executed } = fakeCtx()
+    const timers = fakeTimers()
+    apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
+    const agent = agentWithLog([{ type: 'turn/end' }, { type: 'compaction/end' }])
+    emit('agent/status', { agent, status: 'idle' })
+    timers.fireAll()
+    await settle()
+    assert.deepEqual(executed, [])
+  })
+
+  it('autocompacts a session whose last turn closed after its last compaction', async () => {
+    const { ctx, emit, executed } = fakeCtx()
+    const timers = fakeTimers()
+    apply(ctx as never, { rules: [{ provider: 'deepseek', minutes: 5 }] }, timers)
+    const agent = agentWithLog([{ type: 'compaction/end' }, { type: 'turn/start' }, { type: 'turn/end' }])
     emit('agent/status', { agent, status: 'idle' })
     timers.fireAll()
     await settle()
