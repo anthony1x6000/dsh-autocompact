@@ -9,6 +9,9 @@
  * Every compaction (manual, idle or automatic) also logs how much of the
  * summarization request was read from the provider's prompt cache.
  *
+ * A session whose newest history activity is already a compaction is left
+ * alone, so a manual `/compact` during an idle stretch is not compacted again.
+ *
  * Rules live in the plugin config (Plugins -> dsh-autocompact -> idle-autocompact)
  * and match a route by
  * provider, model, or both. The most specific match wins:
@@ -54,6 +57,18 @@ export interface Route {
     provider?: string;
     model?: string;
 }
+/** The session-log slice a compaction check reads. A harness `Session` satisfies it. */
+export interface CompactionLog {
+    /** The log length: one past the newest seq. */
+    readonly seq: number;
+    /** One event by seq, or undefined past the end of the log. */
+    eventAt(seq: number): {
+        type: string;
+        data?: {
+            error?: string;
+        };
+    } | undefined;
+}
 /** The slice of a DSH `Agent` this plugin reads; also satisfies `ManualCompactAgentContext`. */
 export interface IdleAgent {
     status: 'idle' | 'running';
@@ -61,7 +76,7 @@ export interface IdleAgent {
         provider?: string;
         model?: string;
     };
-    session: {
+    session: CompactionLog & {
         /** Durable session identity; the host archive set is keyed by `header.id`. */
         header: {
             id: string;
@@ -111,6 +126,21 @@ export interface CacheUsage {
  * @returns a one-line summary with the cache-read share and the raw counts.
  */
 export declare function formatCacheUsage(usage: CacheUsage | undefined): string;
+/**
+ * Whether the session's newest history activity is a completed compaction.
+ * Walks back from the newest event: a `turn/end` means a turn closed after any
+ * older compaction, while a successful `compaction/end` (`error` absent) means
+ * the compaction is still the newest thing that happened. A manual `/compact`
+ * runs between turns, so it reports true until the next turn closes; a failed
+ * attempt, the in-flight `compaction/start` bracket, and every other event are
+ * walked past.
+ *
+ * The scan ends at the first deciding event, so it reads only the events since
+ * the newest turn boundary — a handful for the idle sessions this plugin fires on.
+ * @param session - session whose history tail is inspected.
+ * @returns true when the newest turn/compaction event is a successful compaction.
+ */
+export declare function historyEndsWithCompaction(session: CompactionLog): boolean;
 /** Logger subset used for diagnostics. */
 export interface Log {
     info(message: string): void;
@@ -126,6 +156,12 @@ export interface IdleCompactorDeps<A extends IdleAgent> {
      * fire time, and their idle period is consumed like any other skipped fire.
      */
     archived?(agent: A): boolean;
+    /**
+     * Whether the agent's history already ends with a compaction. Read at fire
+     * time, so a `/compact` that lands during the idle stretch is honored; a
+     * skipped fire consumes the idle period like any other.
+     */
+    compacted?(agent: A): boolean;
     log: Log;
     timers?: Timers;
 }

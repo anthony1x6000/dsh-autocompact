@@ -59,6 +59,10 @@ with neither `provider` nor `model`, and negative minutes fail at load.
   agent's configured model before the first request.
 - One compaction per idle period; it does not repeat until the session has been
   active again.
+- A session whose newest history activity is already a compaction is never
+  compacted. The history tail is read when the timer fires, so a manual
+  `/compact` during the countdown consumes that idle period instead of being
+  compacted again; the next turn re-arms it as usual.
 - A session in the host's archive set is never compacted. The set is read when
   the timer fires, so a thread archived during its countdown is skipped and that
   idle period is consumed; unarchive it and it compacts again after its next idle
