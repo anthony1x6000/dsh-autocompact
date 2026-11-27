@@ -55,6 +55,10 @@ Or set it in your profile patch:
       - provider: opencode-go       # exact route, token trigger only
         model: glm-5.3
         tokens: 0                   # 0 / blank disables that trigger
+      - provider: opencode-go       # declared window reduced on purpose
+        model: deepseek-v4.1-flash
+        tokens: 900000
+        contextWindow: 1000000      # real capacity for this route
 ```
 
 | Rule has | Matches | Priority |
@@ -68,6 +72,32 @@ not inherit the broader rule's idle minutes or token threshold. A trigger is off
 when it is absent, blank, or `0`. Routes with no matching rule are never
 autocompacted. Duplicate selectors, non-finite or negative minutes, and negative
 or fractional token thresholds fail at load.
+
+## Exceeding a reduced context window
+
+If a route's declared `contextWindow` is deliberately smaller than what the model
+really supports, set the rule's `contextWindow` to the real capacity. The
+`dsh-llm-pi-ai` adapter turns a successful response whose reported prompt is
+above the declared window into `CONTEXT_WINDOW_EXCEEDED`; the plugin's
+`llm/stream` listener restores the successful finish (`stop` or `tool-calls`)
+when all of these hold:
+
+- the stream completed (every started block ended and the adapter emitted its
+  replay state),
+- usage was reported, and
+- the reported prompt (`input + cacheRead + cacheWrite`) is below the rule's
+  `contextWindow`.
+
+A genuine overflow (prompt beyond the override), a provider-raised error, or an
+interrupted stream keeps its failure. The override covers ordinary requests and
+the compaction summary call alike.
+
+Keep `tokens` below `contextWindow` so the trigger fires before the real limit.
+Note that `dsh-compaction-basic` still measures the declared window; on a profile
+where you want to pass it, set that backend's `auto: false` (or a policy that
+fits), because otherwise it can compact at its own threshold first. Only declare
+a real capacity you know: a provider that silently truncates input within it can
+be presented as a success.
 
 ## Behavior
 
