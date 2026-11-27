@@ -1,15 +1,17 @@
-# Idle autocompact bundle: compacts a session after N idle minutes, N chosen
-# per model route. Install:
+# Autocompact bundle: compacts a session after N idle minutes and/or once its
+# measured context pressure reaches N tokens, both chosen per model route.
+# Install:
 #   dsh plugin --profile web add "github:anthony1x6000/dsh-autocompact#main"
 # With no rules nothing is compacted; add rows on the Plugins page (Configure on the idle-autocompact row), or here:
 #   rules:
 #     - provider: deepseek        # provider only: any model on this provider
 #       minutes: 10
 #     - model: deepseek-chat      # model only: any provider serving it
-#       minutes: 5
-#     - provider: deepseek        # both: most specific, beats the two above
+#       tokens: 250000
+#     - provider: deepseek        # both selectors: most specific, beats the two above
 #       model: deepseek-reasoner
-#       minutes: 0                # 0 disables this route
+#       minutes: 0                # 0 / blank disables that trigger
+#       tokens: 300000
 - insert:
     - id: idle-autocompact
       name: 'dsh-autocompact'

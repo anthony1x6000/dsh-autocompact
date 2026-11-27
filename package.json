@@ -1,7 +1,7 @@
 {
   "name": "dsh-autocompact",
-  "version": "0.2.0",
-  "description": "Idle autocompact for DeepSeek Harness: compact a session after N idle minutes, configured per model or provider on the Plugins page",
+  "version": "0.3.0",
+  "description": "Idle and token autocompact for DeepSeek Harness: compact a session after N idle minutes or at N context tokens, configured per model or provider on the Plugins page",
   "keywords": [
     "deepseek-harness",
     "dsh-plugin",
