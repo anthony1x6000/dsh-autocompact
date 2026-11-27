@@ -1,10 +1,16 @@
 /**
- * Idle autocompact for the DeepSeek Harness.
+ * Idle and token autocompact for the DeepSeek Harness.
  *
  * After a session has been idle for N minutes (the minutes configured for the
  * model route it last used), the `/compact` command condenses it. Useful
  * when a provider's prompt cache expires after a quiet period: the next turn
  * then starts from a short summary instead of re-reading a long cold history.
+ *
+ * A rule may instead (or also) set a token threshold. At every step boundary,
+ * a session whose measured context pressure reaches the route's threshold is
+ * compacted mid-turn, through the agent's own compaction backend. This keeps a
+ * long single turn below the window even when the backend's own pressure policy
+ * is unconfigured or disabled. One attempt is made per threshold crossing.
  *
  * Every compaction (manual, idle or automatic) also logs how much of the
  * summarization request was read from the provider's prompt cache.
@@ -15,9 +21,11 @@
  * Rules live in the plugin config (Plugins -> dsh-autocompact -> idle-autocompact)
  * and match a route by
  * provider, model, or both. The most specific match wins:
- * `provider+model` > `model` > `provider`. `minutes: 0` disables a route that
- * a broader rule would otherwise cover. Unmatched routes are never compacted.
- * Sessions in the host's archive set are never compacted either.
+ * `provider+model` > `model` > `provider`. `minutes: 0` and `tokens: 0`
+ * disable one trigger on a route that a broader rule would otherwise cover;
+ * a more specific rule does not inherit the broader rule's triggers. Unmatched
+ * routes are never compacted. Sessions in the host's archive set are never
+ * compacted either.
  *
  * @module dsh-autocompact
  */
@@ -27,17 +35,21 @@ export declare const name = "idle-autocompact";
 /**
  * The command registry, which is mounted at root in every profile. The
  * compaction backend itself is not: the web profile builds it inside each agent
- * preset, so a root plugin injecting `compaction` would wait forever.
+ * preset, so a root plugin injecting `compaction` would wait forever. The token
+ * path therefore resolves the backend per agent instead of injecting it: from
+ * the agent preset registry when present, else from a root backend.
  */
 export declare const inject: string[];
-/** One idle rule: a route selector plus the idle minutes before compaction. */
+/** One rule: a route selector plus the idle and/or token triggers. */
 export interface Rule {
     /** Provider route to match; omit to match any provider. */
     provider?: string;
     /** Model id to match; omit to match any model. */
     model?: string;
-    /** Idle minutes before compaction; 0 disables the matched route. */
-    minutes: number;
+    /** Idle minutes before compaction; 0 or absent disables the idle trigger. */
+    minutes?: number;
+    /** Context-pressure token threshold; 0 or absent disables the token trigger. */
+    tokens?: number;
 }
 /** A rules table, or a live volatile reference to one (what the loader hands a `.volatile()` field). */
 export type RulesSource = Rule[] | {
@@ -89,6 +101,8 @@ export interface IdleAgent {
         } | undefined;
     };
     runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>;
+    /** Agent-scoped context; the preset registry reads it to find a preset-mounted service. */
+    ctx?: unknown;
 }
 /** Timer seam so tests can drive time. */
 export interface Timers {
@@ -98,16 +112,24 @@ export interface Timers {
 /**
  * Reject a rules table that cannot be resolved unambiguously.
  * @param rules - rows from the plugin config.
- * @throws when a row has no selector, bad minutes, or duplicates another row.
+ * @throws when a row has no selector, bad minutes or tokens, or duplicates another row.
  */
 export declare function validateRules(rules: readonly Rule[]): void;
 /**
- * Pick the idle minutes for a route: provider+model, then model, then provider.
+ * Idle minutes for a route. A more specific rule replaces, never inherits, the broader one.
  * @param rules - validated rules table.
  * @param route - provider/model the session last used.
- * @returns minutes > 0, or undefined when unmatched or disabled with 0.
+ * @returns minutes > 0, or undefined when unmatched or disabled.
  */
 export declare function resolveIdleMinutes(rules: readonly Rule[], route: Route): number | undefined;
+/**
+ * Context-pressure token threshold for a route. Absent on the matched rule, or 0,
+ * disables the token trigger there instead of inheriting a broader threshold.
+ * @param rules - validated rules table.
+ * @param route - provider/model the session last used.
+ * @returns tokens > 0, or undefined when unmatched or disabled.
+ */
+export declare function resolveTokenThreshold(rules: readonly Rule[], route: Route): number | undefined;
 /**
  * The route a session last used: the latest request header, else the agent options.
  * @param agent - agent whose session is inspected.
@@ -141,6 +163,57 @@ export declare function formatCacheUsage(usage: CacheUsage | undefined): string;
  * @returns true when the newest turn/compaction event is a successful compaction.
  */
 export declare function historyEndsWithCompaction(session: CompactionLog): boolean;
+/** The slice of the harness token meter this plugin reads. */
+export interface TokenMeter {
+    /** Current request-and-response pressure for one session, at the durable log revision. */
+    measure(session: unknown): {
+        totalTokens: number;
+    };
+}
+/** What a compaction backend reports for one successful replacement; only logging reads it. */
+export interface CompactionOutcome {
+    readonly shadowedSeqs?: readonly unknown[];
+    readonly shadowedTokenCount?: number;
+}
+/** The slice of a harness compaction backend this plugin calls. */
+export interface CompactionEngine {
+    /**
+     * Force one useful balanced reduction. The overflow trigger bypasses the
+     * backend's own pressure threshold and kept tail, which is what a rule's
+     * token trigger wants when that policy is unconfigured or disabled.
+     */
+    compactIfNeeded(agent: IdleAgent, trigger: 'context-overflow', signal: AbortSignal): Promise<CompactionOutcome | null>;
+}
+/** Dependencies of {@link TokenCompactor}. */
+export interface TokenCompactorDeps<A extends IdleAgent> {
+    /** Current rules; read at every step so live edits apply to the next boundary. */
+    rules(): readonly Rule[];
+    /** Host token meter, or undefined in a composition that mounts none. */
+    meter(): TokenMeter | undefined;
+    /** The agent's reachable compaction backend, or undefined when none is mounted. */
+    engine(agent: A): CompactionEngine | undefined;
+    log: Log;
+}
+/**
+ * Compact a session at a step boundary once its measured context pressure
+ * reaches the route's token threshold. One attempt is made per crossing:
+ * further steps stay quiet until pressure drops below the threshold again,
+ * which keeps a partial reduction or an impossible range from retrying every
+ * step. A failed attempt is logged and never breaks the turn.
+ */
+export declare class TokenCompactor<A extends IdleAgent> {
+    private readonly overThreshold;
+    private meterWarned;
+    private readonly deps;
+    constructor(deps: TokenCompactorDeps<A>);
+    /**
+     * Check one step boundary and compact when the route's threshold is crossed.
+     * @param agent - agent whose request is about to be prepared.
+     * @param signal - the open turn's cancellation signal.
+     * @returns true when a compaction was started and returned a result.
+     */
+    check(agent: A, signal: AbortSignal): Promise<boolean>;
+}
 /** Logger subset used for diagnostics. */
 export interface Log {
     info(message: string): void;
@@ -162,6 +235,12 @@ export interface IdleCompactorDeps<A extends IdleAgent> {
      * skipped fire consumes the idle period like any other.
      */
     compacted?(agent: A): boolean;
+    /**
+     * Whether the route's token threshold is already reached. Read when the agent
+     * becomes idle and on every refresh, so a session that crossed its threshold
+     * is condensed right away instead of waiting for its idle minutes.
+     */
+    tokenDue?(agent: A): boolean;
     log: Log;
     timers?: Timers;
 }
@@ -203,9 +282,14 @@ export interface PluginContext {
     };
     /**
      * Service lookup. The workspace registry is optional: a profile that mounts
-     * none archives nothing, so every session there stays compactable.
+     * none archives nothing, so every session there stays compactable. The token
+     * meter, compaction backend and preset registry are optional too, so a
+     * composition that mounts none keeps the idle command path only.
      */
     get(name: 'workspaceRegistry'): WorkspaceArchive | undefined;
+    get(name: 'tokenMeter'): TokenMeter | undefined;
+    get(name: 'compaction'): CompactionEngine | undefined;
+    get(name: 'agentPresets'): AgentPresets | undefined;
     logger: Log;
     on(event: 'agent/created', handler: (payload: {
         agent: IdleAgent;
@@ -217,6 +301,10 @@ export interface PluginContext {
     on(event: 'agent/disposed', handler: (payload: {
         agent: IdleAgent;
     }) => void): unknown;
+    on(event: 'agent/pre-step', handler: (payload: {
+        agent: IdleAgent;
+        signal: AbortSignal;
+    }, next: () => Promise<unknown>) => Promise<unknown>): unknown;
     on(event: 'session/event', handler: (session: unknown, event: {
         type: string;
         data: {
@@ -226,8 +314,19 @@ export interface PluginContext {
     on(event: 'loader/volatile-update', handler: (paths: readonly (readonly string[])[]) => void): unknown;
     effect(factory: () => Generator<() => unknown>, name?: string): unknown;
 }
+/** The slice of the agent preset registry that reaches a preset-mounted service. */
+export interface AgentPresets {
+    /**
+     * Resolve a service supplied inside an agent's isolated preset composition.
+     * Ordinary `ctx.get()` from the profile root cannot see it.
+     */
+    serviceFor(agent: {
+        ctx?: unknown;
+    }, name: 'compaction'): CompactionEngine | undefined;
+}
 /**
- * Watch every agent's lifecycle and compact it after its configured idle time.
+ * Watch every agent's lifecycle and compact it after its configured idle time,
+ * and at every step boundary once the route's token threshold is reached.
  * @param ctx - plugin context; `ctx.commands` must be mounted.
  * @param config - rules table from the plugin config.
  * @param timers - timer seam, replaced only by tests.
