@@ -8,10 +8,14 @@ import {
   IdleCompactor,
   inject,
   resolveIdleMinutes,
+  resolveTokenThreshold,
   routeOf,
+  TokenCompactor,
   validateRules,
+  type CompactionEngine,
   type IdleAgent,
   type Rule,
+  type TokenMeter,
 } from './index.ts'
 
 const MINUTE = 60_000
@@ -89,9 +93,57 @@ describe('resolveIdleMinutes', () => {
   })
 })
 
+describe('resolveTokenThreshold', () => {
+  const rules: Rule[] = [
+    { provider: 'deepseek', tokens: 300_000 },
+    { model: 'deepseek-chat', tokens: 250_000 },
+    { provider: 'deepseek', model: 'deepseek-chat', tokens: 200_000 },
+  ]
+
+  it('prefers provider+model over model over provider', () => {
+    assert.equal(resolveTokenThreshold(rules, { provider: 'deepseek', model: 'deepseek-chat' }), 200_000)
+    assert.equal(resolveTokenThreshold(rules.slice(0, 2), { provider: 'deepseek', model: 'deepseek-chat' }), 250_000)
+    assert.equal(resolveTokenThreshold(rules.slice(0, 1), { provider: 'deepseek', model: 'deepseek-chat' }), 300_000)
+  })
+
+  it('treats an absent or 0 threshold on the most specific rule as disabled', () => {
+    const disabled: Rule[] = [
+      { provider: 'deepseek', tokens: 300_000 },
+      { provider: 'deepseek', model: 'deepseek-chat', tokens: 0 },
+    ]
+    assert.equal(resolveTokenThreshold(disabled, { provider: 'deepseek', model: 'deepseek-chat' }), undefined)
+    assert.equal(resolveTokenThreshold(disabled, { provider: 'deepseek', model: 'other' }), 300_000)
+  })
+
+  it('does not inherit a broader threshold into an override with no tokens', () => {
+    const rules: Rule[] = [
+      { provider: 'deepseek', tokens: 300_000 },
+      { provider: 'deepseek', model: 'deepseek-chat', minutes: 5 },
+    ]
+    assert.equal(resolveTokenThreshold(rules, { provider: 'deepseek', model: 'deepseek-chat' }), undefined)
+  })
+
+  it('returns undefined when nothing matches or the route is unknown', () => {
+    assert.equal(resolveTokenThreshold(rules, { provider: 'x', model: 'y' }), undefined)
+    assert.equal(resolveTokenThreshold(rules, {}), undefined)
+    assert.equal(resolveTokenThreshold([], { provider: 'deepseek', model: 'deepseek-chat' }), undefined)
+  })
+})
+
 describe('validateRules', () => {
   it('accepts a well-formed table', () => {
     assert.doesNotThrow(() => validateRules([{ provider: 'p', minutes: 5 }, { model: 'm', minutes: 0 }]))
+  })
+
+  it('accepts a token-only rule and a rule with both triggers', () => {
+    assert.doesNotThrow(() => validateRules([{ provider: 'p', tokens: 250_000 }]))
+    assert.doesNotThrow(() => validateRules([{ provider: 'p', minutes: 5, tokens: 0 }]))
+  })
+
+  it('rejects negative, fractional and non-finite token thresholds', () => {
+    assert.throws(() => validateRules([{ provider: 'p', tokens: -1 }]), /tokens/)
+    assert.throws(() => validateRules([{ provider: 'p', tokens: 1.5 }]), /tokens/)
+    assert.throws(() => validateRules([{ provider: 'p', tokens: Number.NaN }]), /tokens/)
   })
 
   it('rejects a rule with neither provider nor model', () => {
@@ -128,13 +180,18 @@ describe('routeOf', () => {
 })
 
 describe('IdleCompactor', () => {
-  function setup(rules: Rule[], compact = async () => ({})) {
+  function setup(
+    rules: Rule[],
+    compact = async () => ({}),
+    tokenDue: (agent: IdleAgent) => boolean = () => false,
+  ) {
     const timers = fakeTimers()
     const compacted: IdleAgent[] = []
     const warnings: string[] = []
     const compactor = new IdleCompactor<IdleAgent>({
       rules: () => rules,
       timers,
+      tokenDue,
       compact: async (agent, signal) => {
         compacted.push(agent)
         return compact(agent, signal)
@@ -143,6 +200,42 @@ describe('IdleCompactor', () => {
     })
     return { timers, compacted, warnings, compactor }
   }
+
+  it('compacts immediately without a timer when the token threshold is already reached', async () => {
+    const { timers, compacted, compactor } = setup(
+      [{ provider: 'deepseek', tokens: 250_000 }],
+      async () => ({}),
+      () => true,
+    )
+    const agent = fakeAgent()
+    compactor.arm(agent)
+    await settle()
+    assert.deepEqual(compacted, [agent])
+    assert.equal(timers.pending.size, 0)
+  })
+
+  it('keeps the idle timer when the token threshold is not reached', () => {
+    const { timers, compactor } = setup([{ provider: 'deepseek', minutes: 5, tokens: 250_000 }])
+    compactor.arm(fakeAgent())
+    assert.equal(timers.pending.size, 1)
+  })
+
+  it('refresh compacts right away when the threshold was crossed while idle', async () => {
+    let due = false
+    const { timers, compacted, compactor } = setup(
+      [{ provider: 'deepseek', minutes: 5, tokens: 250_000 }],
+      async () => ({}),
+      () => due,
+    )
+    const agent = fakeAgent()
+    compactor.arm(agent)
+    assert.equal(timers.pending.size, 1)
+    due = true
+    compactor.refresh()
+    await settle()
+    assert.deepEqual(compacted, [agent])
+    assert.equal(timers.pending.size, 0)
+  })
 
   it('arms a timer of N minutes for a matching rule', () => {
     const { timers, compactor } = setup([{ provider: 'deepseek', minutes: 5 }])
@@ -342,6 +435,118 @@ describe('IdleCompactor', () => {
   })
 })
 
+describe('TokenCompactor', () => {
+  type Call = { agent: IdleAgent; trigger: string; signal: AbortSignal }
+
+  function setup(
+    rules: Rule[],
+    total: () => number,
+    withEngine = true,
+    withMeter = true,
+  ) {
+    const calls: Call[] = []
+    const infos: string[] = []
+    const warnings: string[] = []
+    const engine: CompactionEngine = {
+      async compactIfNeeded(agent, trigger, signal) {
+        calls.push({ agent, trigger, signal })
+        return { shadowedSeqs: [1, 2, 3], shadowedTokenCount: 12_000 }
+      },
+    }
+    const meter: TokenMeter = { measure: () => ({ totalTokens: total() }) }
+    const compactor = new TokenCompactor<IdleAgent>({
+      rules: () => rules,
+      meter: () => withMeter ? meter : undefined,
+      engine: () => withEngine ? engine : undefined,
+      log: { info: (message: string) => infos.push(message), warn: (message: string) => warnings.push(message) },
+    })
+    return { calls, infos, warnings, compactor }
+  }
+
+  const signal = () => new AbortController().signal
+
+  it('does nothing below the route threshold', async () => {
+    const { calls, compactor } = setup([{ provider: 'deepseek', tokens: 250_000 }], () => 249_999)
+    assert.equal(await compactor.check(fakeAgent(), signal()), false)
+    assert.deepEqual(calls, [])
+  })
+
+  it('forces a context-overflow reduction at the threshold and logs the numbers', async () => {
+    const { calls, infos, compactor } = setup([{ provider: 'deepseek', tokens: 250_000 }], () => 250_000)
+    const agent = fakeAgent()
+    assert.equal(await compactor.check(agent, signal()), true)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]?.agent, agent)
+    assert.equal(calls[0]?.trigger, 'context-overflow')
+    assert.match(infos.join('\n'), /250000 tokens/)
+    assert.match(infos.join('\n'), /3 surface nodes/)
+  })
+
+  it('attempts once per crossing and re-arms after the pressure drops', async () => {
+    let total = 250_000
+    const { calls, compactor } = setup([{ provider: 'deepseek', tokens: 250_000 }], () => total)
+    const agent = fakeAgent()
+    assert.equal(await compactor.check(agent, signal()), true)
+    assert.equal(await compactor.check(agent, signal()), false)
+    assert.equal(calls.length, 1)
+    total = 1_000
+    assert.equal(await compactor.check(agent, signal()), false)
+    total = 260_000
+    assert.equal(await compactor.check(agent, signal()), true)
+    assert.equal(calls.length, 2)
+  })
+
+  it('resolves the threshold for the agent route', async () => {
+    const rules: Rule[] = [
+      { model: 'small', tokens: 10_000 },
+      { model: 'large', tokens: 500_000 },
+    ]
+    const { calls, compactor } = setup(rules, () => 20_000)
+    assert.equal(await compactor.check(fakeAgent({ options: { provider: 'p', model: 'small' } }), signal()), true)
+    assert.equal(await compactor.check(fakeAgent({ options: { provider: 'p', model: 'large' } }), signal()), false)
+    assert.equal(calls.length, 1)
+  })
+
+  it('skips a route with no token threshold', async () => {
+    const { calls, compactor } = setup([{ provider: 'deepseek', minutes: 5 }], () => 10_000_000)
+    assert.equal(await compactor.check(fakeAgent(), signal()), false)
+    assert.deepEqual(calls, [])
+  })
+
+  it('warns once and compacts nothing when no token meter is mounted', async () => {
+    const { warnings, compactor } = setup([{ provider: 'deepseek', tokens: 1 }], () => 10, true, false)
+    assert.equal(await compactor.check(fakeAgent(), signal()), false)
+    assert.equal(await compactor.check(fakeAgent(), signal()), false)
+    assert.equal(warnings.filter((line) => /token meter/i.test(line)).length, 1)
+  })
+
+  it('warns when the agent has no reachable compaction backend', async () => {
+    const { warnings, compactor } = setup([{ provider: 'deepseek', tokens: 1 }], () => 10, false)
+    assert.equal(await compactor.check(fakeAgent(), signal()), false)
+    assert.match(warnings.join('\n'), /compaction backend/)
+  })
+
+  it('logs and swallows a backend failure without breaking the step', async () => {
+    const warnings: string[] = []
+    const compactor = new TokenCompactor<IdleAgent>({
+      rules: () => [{ provider: 'deepseek', tokens: 1 }],
+      meter: () => ({ measure: () => ({ totalTokens: 10 }) }),
+      engine: () => ({ compactIfNeeded: async () => { throw new Error('summary exploded') } }),
+      log: { info: () => {}, warn: (message: string) => warnings.push(message) },
+    })
+    assert.equal(await compactor.check(fakeAgent(), signal()), false)
+    assert.match(warnings.join('\n'), /summary exploded/)
+  })
+
+  it('does not start a compaction after the turn was cancelled', async () => {
+    const { calls, compactor } = setup([{ provider: 'deepseek', tokens: 1 }], () => 10)
+    const controller = new AbortController()
+    controller.abort()
+    assert.equal(await compactor.check(fakeAgent(), controller.signal), false)
+    assert.deepEqual(calls, [])
+  })
+})
+
 describe('formatCacheUsage', () => {
   it('reports a warm read when the whole history came from cache', () => {
     assert.equal(
@@ -457,6 +662,11 @@ describe('apply', () => {
   function fakeCtx(
     outcome: Execution | Error | 'missing' = { result: { kind: 'success', text: 'Compacted 3 history items (~900 tokens).' } },
     workspace?: { archivedSessionIds: string[] },
+    services: {
+      tokenMeter?: TokenMeter
+      compaction?: CompactionEngine
+      agentPresets?: { serviceFor(agent: IdleAgent, name: string): CompactionEngine | undefined }
+    } = {},
   ) {
     const handlers = new Map<string, (...args: never[]) => unknown>()
     const disposers: Array<() => unknown> = []
@@ -472,7 +682,11 @@ describe('apply', () => {
         },
       },
       get(name: string) {
-        return name === 'workspaceRegistry' ? workspace : undefined
+        if (name === 'workspaceRegistry') return workspace
+        if (name === 'tokenMeter') return services.tokenMeter
+        if (name === 'compaction') return services.compaction
+        if (name === 'agentPresets') return services.agentPresets
+        return undefined
       },
       logger: { info: (m: string) => infos.push(m), warn: (m: string) => warnings.push(m) },
       on(event: string, handler: (...args: never[]) => unknown) {
@@ -500,6 +714,95 @@ describe('apply', () => {
 
   it('injects the commands service, which every composed profile mounts at root', () => {
     assert.deepEqual(inject, ['commands'])
+  })
+
+  describe('step-boundary token trigger', () => {
+    function fakeBackend() {
+      const calls: Array<{ agent: IdleAgent; trigger: string; signal: AbortSignal }> = []
+      const engine: CompactionEngine = {
+        async compactIfNeeded(agent, trigger, signal) {
+          calls.push({ agent, trigger, signal })
+          return { shadowedSeqs: [7], shadowedTokenCount: 1_000 }
+        },
+      }
+      return { calls, engine }
+    }
+
+    async function step(
+      ctx: ReturnType<typeof fakeCtx>['ctx'],
+      emit: ReturnType<typeof fakeCtx>['emit'],
+      agent = fakeAgent(),
+      signal?: AbortSignal,
+    ) {
+      const decisions: unknown[] = []
+      await (emit as unknown as (
+        event: string,
+        payload: unknown,
+        next: () => Promise<unknown>,
+      ) => Promise<unknown>)('agent/pre-step', { agent, signal: signal ?? new AbortController().signal }, async () => {
+        decisions.push('next')
+        return { kind: 'continue' }
+      })
+      return decisions
+    }
+
+    it('compacts through the agent preset backend when the measured pressure reaches N', async () => {
+      const { calls, engine } = fakeBackend()
+      const tokenMeter: TokenMeter = { measure: () => ({ totalTokens: 352_734 }) }
+      const presets = { serviceFor: (_agent: IdleAgent, name: string) => name === 'compaction' ? engine : undefined }
+      const { ctx, emit } = fakeCtx(undefined, undefined, { tokenMeter, agentPresets: presets })
+      apply(ctx as never, { rules: [{ provider: 'deepseek', model: 'deepseek-chat', tokens: 300_000 }] })
+      const agent = fakeAgent()
+      const decisions = await step(ctx, emit, agent)
+      assert.deepEqual(decisions, ['next'])
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0]?.agent, agent)
+      assert.equal(calls[0]?.trigger, 'context-overflow')
+    })
+
+    it('falls back to a root compaction service when presets are absent', async () => {
+      const { calls, engine } = fakeBackend()
+      const { ctx, emit } = fakeCtx(undefined, undefined, {
+        tokenMeter: { measure: () => ({ totalTokens: 400_000 }) },
+        compaction: engine,
+      })
+      apply(ctx as never, { rules: [{ provider: 'deepseek', tokens: 300_000 }] })
+      await step(ctx, emit)
+      assert.equal(calls.length, 1)
+    })
+
+    it('advances the step without compacting below the threshold', async () => {
+      const { calls, engine } = fakeBackend()
+      const { ctx, emit } = fakeCtx(undefined, undefined, {
+        tokenMeter: { measure: () => ({ totalTokens: 299_999 }) },
+        compaction: engine,
+      })
+      apply(ctx as never, { rules: [{ provider: 'deepseek', tokens: 300_000 }] })
+      const decisions = await step(ctx, emit)
+      assert.deepEqual(decisions, ['next'])
+      assert.equal(calls.length, 0)
+    })
+
+    it('never blocks the step when no token meter is mounted', async () => {
+      const { ctx, emit } = fakeCtx()
+      apply(ctx as never, { rules: [{ provider: 'deepseek', tokens: 300_000 }] })
+      const decisions = await step(ctx, emit)
+      assert.deepEqual(decisions, ['next'])
+    })
+
+    it('does not compact once the turn is cancelled', async () => {
+      const { calls, engine } = fakeBackend()
+      const { ctx, emit } = fakeCtx(undefined, undefined, {
+        tokenMeter: { measure: () => ({ totalTokens: 400_000 }) },
+        compaction: engine,
+      })
+      apply(ctx as never, { rules: [{ provider: 'deepseek', tokens: 300_000 }] })
+      const controller = new AbortController()
+      controller.abort()
+      const decisions = await step(ctx, emit, fakeAgent(), controller.signal)
+      assert.deepEqual(decisions, ['next'])
+      assert.equal(calls.length, 0)
+    })
   })
 
   it('rejects an invalid rule table at load', () => {

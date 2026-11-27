@@ -33,9 +33,9 @@ interface ClientModule {
   inject: string[]
   apply(ctx: unknown): void
   KEY: string
-  draftFrom(value: unknown): Array<{ provider: string; model: string; minutes: string }>
-  draftErrors(rows: Array<{ provider: string; model: string; minutes: string }>): string[]
-  rulesToOps(rows: Array<{ provider: string; model: string; minutes: string }>): unknown[]
+  draftFrom(value: unknown): Array<{ provider: string; model: string; minutes: string; tokens: string }>
+  draftErrors(rows: Array<{ provider: string; model: string; minutes: string; tokens?: string }>): string[]
+  rulesToOps(rows: Array<{ provider: string; model: string; minutes: string; tokens?: string }>): unknown[]
   providerChoices(groups: CatalogGroup[], current: string): Choice[]
   modelChoices(groups: CatalogGroup[], provider: string, current: string): Choice[]
   loadCatalog(remote: unknown): Promise<CatalogState>
@@ -103,10 +103,15 @@ describe('client module', () => {
 describe('draft helpers', () => {
   it('turns saved rules into editable text rows', () => {
     assert.deepEqual(
-      client.draftFrom({ rules: [{ provider: 'deepseek', minutes: 5 }, { model: 'm', minutes: 0 }] }),
+      client.draftFrom({
+        rules: [
+          { provider: 'deepseek', minutes: 5, tokens: 300_000 },
+          { model: 'm', minutes: 0 },
+        ],
+      }),
       [
-        { provider: 'deepseek', model: '', minutes: '5' },
-        { provider: '', model: 'm', minutes: '0' },
+        { provider: 'deepseek', model: '', minutes: '5', tokens: '300000' },
+        { provider: '', model: 'm', minutes: '0', tokens: '' },
       ],
     )
   })
@@ -119,24 +124,47 @@ describe('draft helpers', () => {
   it('writes the whole rules array with one set op, trimmed, blank selectors omitted', () => {
     assert.deepEqual(
       client.rulesToOps([
-        { provider: ' deepseek ', model: '', minutes: '10' },
+        { provider: ' deepseek ', model: '', minutes: '10', tokens: '300000' },
         { provider: '', model: 'm', minutes: '2.5' },
       ]),
-      [{ op: 'set', path: ['rules'], value: [{ provider: 'deepseek', minutes: 10 }, { model: 'm', minutes: 2.5 }] }],
+      [{
+        op: 'set',
+        path: ['rules'],
+        value: [
+          { provider: 'deepseek', minutes: 10, tokens: 300_000 },
+          { model: 'm', minutes: 2.5 },
+        ],
+      }],
     )
   })
 
-  it('accepts a well-formed draft', () => {
+  it('accepts a well-formed draft with minutes, tokens, or both', () => {
     assert.deepEqual(client.draftErrors([{ provider: 'p', model: '', minutes: '5' }]), [])
+    assert.deepEqual(client.draftErrors([{ provider: 'p', model: '', minutes: '', tokens: '250000' }]), [])
+    assert.deepEqual(client.draftErrors([{ provider: 'p', model: '', minutes: '5', tokens: '0' }]), [])
   })
 
   it('rejects a row with neither provider nor model', () => {
     assert.match(client.draftErrors([{ provider: ' ', model: '', minutes: '5' }]).join(), /provider or model/)
   })
 
+  it('rejects a row that triggers neither idle minutes nor a token threshold', () => {
+    assert.match(client.draftErrors([{ provider: 'p', model: '', minutes: '' }]).join(), /minutes|tokens/)
+  })
+
   it('rejects blank, non-numeric and negative minutes', () => {
     for (const minutes of ['', 'abc', '-1']) {
       assert.match(client.draftErrors([{ provider: 'p', model: '', minutes }]).join(), /minutes/, minutes)
+    }
+  })
+
+  it('rejects non-numeric, fractional and negative token thresholds', () => {
+    for (const tokens of ['abc', '1.5', '-1']) {
+      assert.match(
+        client.draftErrors([{ provider: 'p', model: '', minutes: '5', tokens }]).join(),
+        /tokens/,
+        tokens,
+      )
     }
   })
 
