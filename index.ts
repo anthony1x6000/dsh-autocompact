@@ -58,6 +58,12 @@ export interface Rule {
   minutes?: number
   /** Context-pressure token threshold; 0 or absent disables the token trigger. */
   tokens?: number
+  /**
+   * Real context capacity for this route. When the adapter rejects a completed
+   * response only because its reported prompt exceeded a smaller declared
+   * window, accept it while the prompt fits here. 0 or absent disables.
+   */
+  contextWindow?: number
 }
 
 /** A rules table, or a live volatile reference to one (what the loader hands a `.volatile()` field). */
@@ -79,6 +85,9 @@ const ruleSchema = z.object({
   minutes: z.number().min(0).description('Idle minutes before compaction; 0 or blank disables.'),
   tokens: z.number().step(1).min(0).description(
     'Compact when measured context pressure reaches this many tokens; 0 or blank disables.',
+  ),
+  contextWindow: z.number().step(1).min(0).description(
+    'Real context capacity; lets a completed response the adapter rejected above a smaller declared window through.',
   ),
 })
 
@@ -164,6 +173,11 @@ export function validateRules(rules: readonly Rule[]): void {
     if (rule.tokens !== undefined && (!Number.isInteger(rule.tokens) || rule.tokens < 0)) {
       throw new TypeError(`idle-autocompact: tokens must be a whole number >= 0, got ${String(rule.tokens)}`)
     }
+    if (rule.contextWindow !== undefined && (!Number.isInteger(rule.contextWindow) || rule.contextWindow < 0)) {
+      throw new TypeError(
+        `idle-autocompact: contextWindow must be a whole number >= 0, got ${String(rule.contextWindow)}`,
+      )
+    }
     const key = `${provider ?? '*'}/${model ?? '*'}`
     if (seen.has(key)) throw new TypeError(`idle-autocompact: duplicate rule for ${key}`)
     seen.add(key)
@@ -210,6 +224,18 @@ export function resolveIdleMinutes(rules: readonly Rule[], route: Route): number
 export function resolveTokenThreshold(rules: readonly Rule[], route: Route): number | undefined {
   const tokens = resolveRule(rules, route)?.tokens ?? 0
   return tokens > 0 ? tokens : undefined
+}
+
+/**
+ * Declared real capacity for a route whose adapter window was reduced on purpose.
+ * Absent on the matched rule, or 0, disables the override there.
+ * @param rules - validated rules table.
+ * @param route - provider/model the call uses.
+ * @returns a positive capacity, or undefined when unmatched or disabled.
+ */
+export function resolveContextWindow(rules: readonly Rule[], route: Route): number | undefined {
+  const contextWindow = resolveRule(rules, route)?.contextWindow ?? 0
+  return contextWindow > 0 ? contextWindow : undefined
 }
 
 /**
@@ -392,6 +418,155 @@ export class TokenCompactor<A extends IdleAgent> {
   }
 }
 
+/** Failure code the adapter uses when a request or response exceeds the declared window. */
+const OVERFLOW_CODE = 'CONTEXT_WINDOW_EXCEEDED'
+
+/** Provider-reported token counts this plugin reads; counts are disjoint. */
+export interface LlmUsageLike {
+  inputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+}
+
+/** The terminal chunk shape the window override inspects; other chunks pass through untouched. */
+export interface StreamFinishLike {
+  type: 'finish'
+  reason: { kind: string; failure?: { code?: string } }
+  /** Adapter-private successful-response metadata; only a completed provider response carries it. */
+  replayState?: unknown
+}
+
+/** What the stream showed before its terminal finish. */
+export interface FinishObservation {
+  /** Usage the adapter emitted just before the finish. */
+  usage?: LlmUsageLike
+  /** Every started block also ended; an interrupted stream leaves this false. */
+  balanced: boolean
+  /** At least one block completed. */
+  sawBlockEnd: boolean
+  /** A completed tool-call block appeared. */
+  sawToolCall: boolean
+}
+
+/**
+ * Prompt tokens a usage record bills: the counts are disjoint, so the prompt is
+ * their sum.
+ * @param usage - usage the adapter reported, if any.
+ * @returns the billed prompt size, or 0 when nothing was reported.
+ */
+export function promptTokens(usage: LlmUsageLike | undefined): number {
+  if (usage === undefined) return 0
+  return (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+}
+
+/**
+ * Restore a successful finish the adapter rejected only because the reported
+ * prompt exceeded the route's smaller declared window.
+ *
+ * Only a completed provider response qualifies: `replayState` marks the
+ * adapter's `done` event, balanced blocks prove the content arrived whole, and
+ * the prompt must stay below the declared real capacity, leaving room for the
+ * response. A genuine overflow, an interrupted stream, or an error the provider
+ * raised keeps its failure.
+ * @param finish - terminal chunk to inspect.
+ * @param observation - content and usage the stream emitted before it.
+ * @param contextWindow - real capacity override for the route.
+ * @returns the restored finish, or undefined to keep the original.
+ */
+export function restoreSuccessfulFinish(
+  finish: StreamFinishLike,
+  observation: FinishObservation,
+  contextWindow: number | undefined,
+): StreamFinishLike | undefined {
+  if (contextWindow === undefined || contextWindow <= 0) return undefined
+  if (finish.reason.kind !== 'error' || finish.reason.failure?.code !== OVERFLOW_CODE) return undefined
+  if (finish.replayState === undefined) return undefined
+  if (!observation.balanced || !observation.sawBlockEnd) return undefined
+  const prompt = promptTokens(observation.usage)
+  if (prompt <= 0 || prompt >= contextWindow) return undefined
+  return {
+    ...finish,
+    reason: { kind: observation.sawToolCall ? 'tool-calls' : 'stop' },
+  }
+}
+
+/** The few stream-chunk fields the override reads; everything else is passed through. */
+interface RawStreamChunk {
+  type?: unknown
+  index?: unknown
+  block?: { type?: unknown }
+  usage?: LlmUsageLike
+  reason?: { kind?: unknown; failure?: { code?: string } }
+  replayState?: unknown
+}
+
+function isFinishChunk(chunk: unknown): chunk is StreamFinishLike {
+  if (typeof chunk !== 'object' || chunk === null) return false
+  const raw = chunk as RawStreamChunk
+  if (raw.type !== 'finish') return false
+  return typeof raw.reason === 'object'
+    && raw.reason !== null
+    && typeof raw.reason.kind === 'string'
+}
+
+/**
+ * Pass a model stream through, restoring one false-overflow finish when the
+ * route declares a larger real capacity than its adapter window.
+ * @param stream - adapter chunks from the next listener.
+ * @param contextWindow - real capacity override, or undefined to pass through.
+ * @param label - route label for the log line.
+ * @param log - logger.
+ */
+async function* recoverOverWindowStream(
+  stream: AsyncIterable<unknown>,
+  contextWindow: number | undefined,
+  label: string,
+  log: Log,
+): AsyncIterable<unknown> {
+  if (contextWindow === undefined) {
+    yield* stream
+    return
+  }
+  const started = new Set<number>()
+  const ended = new Set<number>()
+  let usage: LlmUsageLike | undefined
+  let sawToolCall = false
+  for await (const chunk of stream) {
+    if (typeof chunk === 'object' && chunk !== null) {
+      const raw = chunk as RawStreamChunk
+      switch (raw.type) {
+        case 'usage':
+          if (typeof raw.usage === 'object' && raw.usage !== null) usage = raw.usage
+          break
+        case 'block-start':
+          if (typeof raw.index === 'number') started.add(raw.index)
+          break
+        case 'block-end':
+          if (typeof raw.index === 'number') ended.add(raw.index)
+          if (raw.block?.type === 'tool-call') sawToolCall = true
+          break
+      }
+    }
+    if (isFinishChunk(chunk)) {
+      const recovered = restoreSuccessfulFinish(chunk, {
+        usage,
+        balanced: started.size === ended.size && [...started].every((index) => ended.has(index)),
+        sawBlockEnd: ended.size > 0,
+        sawToolCall,
+      }, contextWindow)
+      if (recovered !== undefined) {
+        log.info(
+          `context override: ${label} reported ${promptTokens(usage)} prompt tokens above its declared window; `
+          + `accepted the completed response within the ${contextWindow}-token override`,
+        )
+        yield recovered
+        continue
+      }
+    }
+    yield chunk
+  }
+}
+
 /** Render an unknown thrown value for one log line. */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -552,6 +727,13 @@ export interface PluginContext {
     ) => Promise<unknown>,
   ): unknown
   on(
+    event: 'llm/stream',
+    handler: (
+      options: { provider: string; model: string },
+      next: () => AsyncIterable<unknown>,
+    ) => AsyncIterable<unknown>,
+  ): unknown
+  on(
     event: 'session/event',
     handler: (session: unknown, event: { type: string; data: { usage?: CacheUsage } }) => void,
   ): unknown
@@ -695,6 +877,15 @@ export function apply(ctx: PluginContext, config: Config = {}, timers?: Timers):
       ctx.logger.warn(`token autocompact check failed: ${error instanceof Error ? error.message : String(error)}`)
     }
     return next()
+  })
+  ctx.on('llm/stream', (options, next) => {
+    const override = resolveContextWindow(rules(), { provider: options.provider, model: options.model })
+    return recoverOverWindowStream(
+      next(),
+      override,
+      `${options.provider}/${options.model}`,
+      ctx.logger,
+    )
   })
   ctx.on('session/event', (_session, event) => {
     if (event.type === 'compaction/summary') ctx.logger.info(`compaction cache: ${formatCacheUsage(event.data.usage)}`)

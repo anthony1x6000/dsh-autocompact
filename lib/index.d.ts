@@ -50,6 +50,12 @@ export interface Rule {
     minutes?: number;
     /** Context-pressure token threshold; 0 or absent disables the token trigger. */
     tokens?: number;
+    /**
+     * Real context capacity for this route. When the adapter rejects a completed
+     * response only because its reported prompt exceeded a smaller declared
+     * window, accept it while the prompt fits here. 0 or absent disables.
+     */
+    contextWindow?: number;
 }
 /** A rules table, or a live volatile reference to one (what the loader hands a `.volatile()` field). */
 export type RulesSource = Rule[] | {
@@ -130,6 +136,14 @@ export declare function resolveIdleMinutes(rules: readonly Rule[], route: Route)
  * @returns tokens > 0, or undefined when unmatched or disabled.
  */
 export declare function resolveTokenThreshold(rules: readonly Rule[], route: Route): number | undefined;
+/**
+ * Declared real capacity for a route whose adapter window was reduced on purpose.
+ * Absent on the matched rule, or 0, disables the override there.
+ * @param rules - validated rules table.
+ * @param route - provider/model the call uses.
+ * @returns a positive capacity, or undefined when unmatched or disabled.
+ */
+export declare function resolveContextWindow(rules: readonly Rule[], route: Route): number | undefined;
 /**
  * The route a session last used: the latest request header, else the agent options.
  * @param agent - agent whose session is inspected.
@@ -214,6 +228,57 @@ export declare class TokenCompactor<A extends IdleAgent> {
      */
     check(agent: A, signal: AbortSignal): Promise<boolean>;
 }
+/** Provider-reported token counts this plugin reads; counts are disjoint. */
+export interface LlmUsageLike {
+    inputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+}
+/** The terminal chunk shape the window override inspects; other chunks pass through untouched. */
+export interface StreamFinishLike {
+    type: 'finish';
+    reason: {
+        kind: string;
+        failure?: {
+            code?: string;
+        };
+    };
+    /** Adapter-private successful-response metadata; only a completed provider response carries it. */
+    replayState?: unknown;
+}
+/** What the stream showed before its terminal finish. */
+export interface FinishObservation {
+    /** Usage the adapter emitted just before the finish. */
+    usage?: LlmUsageLike;
+    /** Every started block also ended; an interrupted stream leaves this false. */
+    balanced: boolean;
+    /** At least one block completed. */
+    sawBlockEnd: boolean;
+    /** A completed tool-call block appeared. */
+    sawToolCall: boolean;
+}
+/**
+ * Prompt tokens a usage record bills: the counts are disjoint, so the prompt is
+ * their sum.
+ * @param usage - usage the adapter reported, if any.
+ * @returns the billed prompt size, or 0 when nothing was reported.
+ */
+export declare function promptTokens(usage: LlmUsageLike | undefined): number;
+/**
+ * Restore a successful finish the adapter rejected only because the reported
+ * prompt exceeded the route's smaller declared window.
+ *
+ * Only a completed provider response qualifies: `replayState` marks the
+ * adapter's `done` event, balanced blocks prove the content arrived whole, and
+ * the prompt must stay below the declared real capacity, leaving room for the
+ * response. A genuine overflow, an interrupted stream, or an error the provider
+ * raised keeps its failure.
+ * @param finish - terminal chunk to inspect.
+ * @param observation - content and usage the stream emitted before it.
+ * @param contextWindow - real capacity override for the route.
+ * @returns the restored finish, or undefined to keep the original.
+ */
+export declare function restoreSuccessfulFinish(finish: StreamFinishLike, observation: FinishObservation, contextWindow: number | undefined): StreamFinishLike | undefined;
 /** Logger subset used for diagnostics. */
 export interface Log {
     info(message: string): void;
@@ -305,6 +370,10 @@ export interface PluginContext {
         agent: IdleAgent;
         signal: AbortSignal;
     }, next: () => Promise<unknown>) => Promise<unknown>): unknown;
+    on(event: 'llm/stream', handler: (options: {
+        provider: string;
+        model: string;
+    }, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>): unknown;
     on(event: 'session/event', handler: (session: unknown, event: {
         type: string;
         data: {

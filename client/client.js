@@ -22,11 +22,12 @@ window.__ModuleLoader__.load({
 
 		const en = {
 			summary: "Compact a session after N idle minutes or at N context tokens, per model or provider.",
-			hint: "Most specific rule wins: provider + model, then model, then provider. A trigger of blank or 0 is off; unmatched routes are never compacted.",
+			hint: "Most specific rule wins: provider + model, then model, then provider. A blank or 0 trigger is off; unmatched routes are never compacted. Set context window to the route's real capacity to accept responses the adapter would reject above a smaller declared window.",
 			provider: "Provider",
 			model: "Model",
 			minutes: "Idle minutes",
 			tokens: "Context tokens",
+			contextWindow: "Context window",
 			anyProvider: "Any provider",
 			anyModel: "Any model",
 			empty: "No rules yet, so nothing is compacted.",
@@ -45,11 +46,12 @@ window.__ModuleLoader__.load({
 		};
 		const zh = {
 			summary: "会话空闲 N 分钟后或上下文达到 N 个 token 时自动压缩，可按模型或提供方分别设置。",
-			hint: "优先级：提供方 + 模型，其次模型，再次提供方。触发条件留空或为 0 表示关闭；未匹配的路由从不压缩。",
+			hint: "优先级：提供方 + 模型，其次模型，再次提供方。触发条件留空或为 0 表示关闭；未匹配的路由从不压缩。将上下文窗口设为该路由的真实容量，即可接受适配器以声明窗口较小为由拒绝的响应。",
 			provider: "提供方",
 			model: "模型",
 			minutes: "空闲分钟数",
 			tokens: "Token 阈值",
+			contextWindow: "上下文窗口",
 			anyProvider: "任意提供方",
 			anyModel: "任意模型",
 			empty: "还没有规则，因此不会压缩任何会话。",
@@ -78,6 +80,7 @@ window.__ModuleLoader__.load({
 				model: rule.model ?? "",
 				minutes: String(rule.minutes ?? ""),
 				tokens: String(rule.tokens ?? ""),
+				contextWindow: String(rule.contextWindow ?? ""),
 			}));
 		}
 
@@ -100,6 +103,10 @@ window.__ModuleLoader__.load({
 				const tokens = (row.tokens ?? "").trim();
 				if (tokens !== "" && (!Number.isInteger(Number(tokens)) || Number(tokens) < 0)) {
 					errors.push(label + ": tokens must be a whole number of 0 or more");
+				}
+				const contextWindow = (row.contextWindow ?? "").trim();
+				if (contextWindow !== "" && (!Number.isInteger(Number(contextWindow)) || Number(contextWindow) < 0)) {
+					errors.push(label + ": context window must be a whole number of 0 or more");
 				}
 				if (minutes === "" && tokens === "") errors.push(label + ": needs idle minutes or a token threshold");
 				const key = (provider || "*") + "/" + (model || "*");
@@ -194,11 +201,13 @@ window.__ModuleLoader__.load({
 				const model = row.model.trim();
 				const minutes = (row.minutes ?? "").trim();
 				const tokens = (row.tokens ?? "").trim();
+				const contextWindow = (row.contextWindow ?? "").trim();
 				return {
 					...(provider ? { provider } : {}),
 					...(model ? { model } : {}),
 					...(minutes !== "" ? { minutes: Number(minutes) } : {}),
 					...(tokens !== "" ? { tokens: Number(tokens) } : {}),
+					...(contextWindow !== "" ? { contextWindow: Number(contextWindow) } : {}),
 				};
 			});
 			return [{ op: "set", path: ["rules"], value }];
@@ -217,7 +226,7 @@ window.__ModuleLoader__.load({
 			borderRadius: "var(--dsw-radius-md)",
 		};
 		const selectStyle = { ...inputStyle, appearance: "auto" };
-		const rowStyle = { display: "grid", gridTemplateColumns: "1fr 1fr 90px 120px auto", gap: 8, alignItems: "center" };
+		const rowStyle = { display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) 76px 104px 116px auto", gap: 8, alignItems: "center" };
 		const noteStyle = { margin: 0, fontSize: 12, lineHeight: "18px", color: "var(--dsw-alias-label-tertiary)" };
 		const errorStyle = { ...noteStyle, color: "var(--dsw-alias-state-error-primary)" };
 
@@ -293,6 +302,14 @@ window.__ModuleLoader__.load({
 				style: inputStyle,
 				onChange: (event) => edit(index, "tokens", event.target.value),
 			});
+			const contextWindow = (index) => h("input", {
+				value: rows[index].contextWindow,
+				inputMode: "numeric",
+				"aria-label": t("contextWindow"),
+				disabled: locked,
+				style: inputStyle,
+				onChange: (event) => edit(index, "contextWindow", event.target.value),
+			});
 
 			return h("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
 				h("p", { style: noteStyle }, t("hint")),
@@ -302,18 +319,20 @@ window.__ModuleLoader__.load({
 					h("span", { style: noteStyle }, t("model")),
 					h("span", { style: noteStyle }, t("minutes")),
 					h("span", { style: noteStyle }, t("tokens")),
+					h("span", { style: noteStyle }, t("contextWindow")),
 					h("span")),
 				rows.map((row, index) => h("div", { key: index, style: rowStyle },
 					select(index, "provider", providerChoices(groups, row.provider), t("anyProvider")),
 					select(index, "model", modelChoices(groups, row.provider, row.model), t("anyModel")),
 					minutes(index),
 					tokens(index),
+					contextWindow(index),
 					h(Button, { variant: "outline", size: "sm", disabled: locked, onClick: () => change(rows.filter((__, i) => i !== index)) }, t("remove")))),
 				errors.map((message) => h("p", { key: message, style: errorStyle, role: "alert" }, message)),
 				failed ? h("p", { style: errorStyle, role: "alert" }, t("saveFailed")) : null,
 				locked ? h("p", { style: noteStyle }, t("readOnly")) : null,
 				h("div", { style: { display: "flex", gap: 8 } },
-					h(Button, { variant: "outline", size: "sm", disabled: locked, onClick: () => change([...rows, { provider: "", model: "", minutes: "10", tokens: "" }]) }, t("add")),
+					h(Button, { variant: "outline", size: "sm", disabled: locked, onClick: () => change([...rows, { provider: "", model: "", minutes: "10", tokens: "", contextWindow: "" }]) }, t("add")),
 					h(Button, { variant: "primary", size: "sm", disabled: locked || !draft || errors.length > 0 || saving, onClick: save }, saving ? t("saving") : t("save"))));
 		}
 

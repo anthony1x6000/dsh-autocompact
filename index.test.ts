@@ -7,8 +7,10 @@ import {
   historyEndsWithCompaction,
   IdleCompactor,
   inject,
+  resolveContextWindow,
   resolveIdleMinutes,
   resolveTokenThreshold,
+  restoreSuccessfulFinish,
   routeOf,
   TokenCompactor,
   validateRules,
@@ -130,6 +132,94 @@ describe('resolveTokenThreshold', () => {
   })
 })
 
+describe('resolveContextWindow', () => {
+  const rules: Rule[] = [
+    { provider: 'openai', contextWindow: 500_000 },
+    { model: 'squished', contextWindow: 900_000 },
+    { provider: 'openai', model: 'squished', contextWindow: 1_000_000 },
+  ]
+
+  it('prefers provider+model over model over provider', () => {
+    assert.equal(resolveContextWindow(rules, { provider: 'openai', model: 'squished' }), 1_000_000)
+    assert.equal(resolveContextWindow(rules.slice(0, 2), { provider: 'openai', model: 'squished' }), 900_000)
+    assert.equal(resolveContextWindow(rules.slice(0, 1), { provider: 'openai', model: 'squished' }), 500_000)
+  })
+
+  it('treats an absent or 0 override on the most specific rule as disabled', () => {
+    const disabled: Rule[] = [
+      { provider: 'openai', contextWindow: 1_000_000 },
+      { provider: 'openai', model: 'squished', contextWindow: 0 },
+    ]
+    assert.equal(resolveContextWindow(disabled, { provider: 'openai', model: 'squished' }), undefined)
+    assert.equal(resolveContextWindow(disabled, { provider: 'openai', model: 'other' }), 1_000_000)
+  })
+
+  it('returns undefined when nothing matches', () => {
+    assert.equal(resolveContextWindow(rules, { provider: 'x', model: 'y' }), undefined)
+    assert.equal(resolveContextWindow([], { provider: 'openai', model: 'squished' }), undefined)
+  })
+})
+
+describe('restoreSuccessfulFinish', () => {
+  const replayState = { response: { id: 'resp-1' }, blocks: [{}] }
+  const overflow = { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED' } }
+  const finish = (reason: unknown = overflow) => ({ type: 'finish' as const, reason, replayState })
+  const observed = (overrides: Record<string, unknown> = {}) => ({
+    usage: { inputTokens: 500_000 },
+    balanced: true,
+    sawBlockEnd: true,
+    sawToolCall: false,
+    ...overrides,
+  })
+
+  it('restores a successful stop when the prompt fits the override and blocks streamed', () => {
+    assert.deepEqual(
+      restoreSuccessfulFinish(finish() as never, observed() as never, 1_000_000),
+      { type: 'finish', reason: { kind: 'stop' }, replayState },
+    )
+  })
+
+  it('restores tool-calls when a tool call streamed', () => {
+    assert.deepEqual(
+      restoreSuccessfulFinish(finish() as never, observed({ sawToolCall: true }) as never, 1_000_000),
+      { type: 'finish', reason: { kind: 'tool-calls' }, replayState },
+    )
+  })
+
+  it('counts cached input against the override', () => {
+    const usage = { inputTokens: 200_000, cacheReadTokens: 700_000 }
+    assert.equal(restoreSuccessfulFinish(finish() as never, observed({ usage }) as never, 900_000), undefined)
+    assert.deepEqual(
+      restoreSuccessfulFinish(finish() as never, observed({ usage }) as never, 950_000)?.reason,
+      { kind: 'stop' },
+    )
+  })
+
+  it('keeps a genuine overflow beyond the override', () => {
+    assert.equal(restoreSuccessfulFinish(finish() as never, observed() as never, 500_000), undefined)
+  })
+
+  it('keeps errors that did not come from a completed provider response', () => {
+    assert.equal(
+      restoreSuccessfulFinish({ type: 'finish', reason: overflow } as never, observed() as never, 1_000_000),
+      undefined,
+    )
+    assert.equal(restoreSuccessfulFinish(finish() as never, observed({ balanced: false }) as never, 1_000_000), undefined)
+    assert.equal(restoreSuccessfulFinish(finish() as never, observed({ sawBlockEnd: false }) as never, 1_000_000), undefined)
+    assert.equal(restoreSuccessfulFinish(finish() as never, observed({ usage: undefined }) as never, 1_000_000), undefined)
+  })
+
+  it('ignores other failure codes and already-successful finishes', () => {
+    const rateLimit = { kind: 'error', failure: { code: 'RATE_LIMIT' } }
+    assert.equal(restoreSuccessfulFinish(finish(rateLimit) as never, observed() as never, 1_000_000), undefined)
+    assert.equal(restoreSuccessfulFinish(finish({ kind: 'stop' }) as never, observed() as never, 1_000_000), undefined)
+  })
+
+  it('does nothing when the route has no override', () => {
+    assert.equal(restoreSuccessfulFinish(finish() as never, observed() as never, undefined), undefined)
+  })
+})
+
 describe('validateRules', () => {
   it('accepts a well-formed table', () => {
     assert.doesNotThrow(() => validateRules([{ provider: 'p', minutes: 5 }, { model: 'm', minutes: 0 }]))
@@ -144,6 +234,13 @@ describe('validateRules', () => {
     assert.throws(() => validateRules([{ provider: 'p', tokens: -1 }]), /tokens/)
     assert.throws(() => validateRules([{ provider: 'p', tokens: 1.5 }]), /tokens/)
     assert.throws(() => validateRules([{ provider: 'p', tokens: Number.NaN }]), /tokens/)
+  })
+
+  it('accepts a positive context-window override and rejects bad ones', () => {
+    assert.doesNotThrow(() => validateRules([{ provider: 'p', contextWindow: 1_000_000 }]))
+    assert.doesNotThrow(() => validateRules([{ provider: 'p', contextWindow: 0 }]))
+    assert.throws(() => validateRules([{ provider: 'p', contextWindow: -1 }]), /contextWindow/)
+    assert.throws(() => validateRules([{ provider: 'p', contextWindow: 1.5 }]), /contextWindow/)
   })
 
   it('rejects a rule with neither provider nor model', () => {
@@ -802,6 +899,71 @@ describe('apply', () => {
       const decisions = await step(ctx, emit, fakeAgent(), controller.signal)
       assert.deepEqual(decisions, ['next'])
       assert.equal(calls.length, 0)
+    })
+  })
+
+  describe('context window override', () => {
+    const overflow = { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED' } }
+    const replayState = { response: { id: 'resp-1' } }
+
+    function chunks(promptTokens: number) {
+      return [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'block-end', index: 0, block: { type: 'text', text: 'hi' } },
+        { type: 'usage', usage: { inputTokens: promptTokens } },
+        { type: 'finish', reason: overflow, replayState },
+      ]
+    }
+
+    async function run(
+      ctx: ReturnType<typeof fakeCtx>['ctx'],
+      emit: ReturnType<typeof fakeCtx>['emit'],
+      source: unknown[],
+    ) {
+      const iterable = (emit as unknown as (
+        event: string,
+        options: { provider: string; model: string },
+        next: () => AsyncIterable<unknown>,
+      ) => AsyncIterable<unknown>)('llm/stream', { provider: 'openai', model: 'squished' }, () => (async function* () {
+        yield* source
+      })())
+      const seen: unknown[] = []
+      for await (const chunk of iterable) seen.push(chunk)
+      return seen
+    }
+
+    it('passes every chunk through untouched when the route has no override', async () => {
+      const { ctx, emit } = fakeCtx()
+      apply(ctx as never, { rules: [{ provider: 'openai', model: 'squished', tokens: 500_000 }] })
+      const seen = await run(ctx, emit, chunks(500_000))
+      assert.deepEqual(seen, chunks(500_000))
+    })
+
+    it('restores a successful finish when the reported prompt fits the override', async () => {
+      const { ctx, emit, infos } = fakeCtx()
+      apply(ctx as never, { rules: [{ provider: 'openai', model: 'squished', contextWindow: 1_000_000 }] })
+      const seen = await run(ctx, emit, chunks(900_000))
+      assert.deepEqual((seen.at(-1) as { reason: unknown }).reason, { kind: 'stop' })
+      assert.match(infos.join('\n'), /context override/)
+    })
+
+    it('leaves a genuine overflow beyond the override as an error', async () => {
+      const { ctx, emit } = fakeCtx()
+      apply(ctx as never, { rules: [{ provider: 'openai', model: 'squished', contextWindow: 1_000_000 }] })
+      const seen = await run(ctx, emit, chunks(1_000_001))
+      assert.deepEqual((seen.at(-1) as { reason: unknown }).reason, overflow)
+    })
+
+    it('leaves an uncompleted stream as an error', async () => {
+      const { ctx, emit } = fakeCtx()
+      apply(ctx as never, { rules: [{ provider: 'openai', model: 'squished', contextWindow: 1_000_000 }] })
+      const interrupted = [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'usage', usage: { inputTokens: 900_000 } },
+        { type: 'finish', reason: overflow, replayState },
+      ]
+      const seen = await run(ctx, emit, interrupted)
+      assert.deepEqual((seen.at(-1) as { reason: unknown }).reason, overflow)
     })
   })
 

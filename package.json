@@ -1,7 +1,7 @@
 {
   "name": "dsh-autocompact",
-  "version": "0.3.0",
-  "description": "Idle and token autocompact for DeepSeek Harness: compact a session after N idle minutes or at N context tokens, configured per model or provider on the Plugins page",
+  "version": "0.4.0",
+  "description": "Idle and token autocompact for DeepSeek Harness: compact a session after N idle minutes or at N context tokens, and optionally let a route with a reduced declared window use its real capacity, configured per model or provider on the Plugins page",
   "keywords": [
     "deepseek-harness",
     "dsh-plugin",

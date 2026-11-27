@@ -12,6 +12,10 @@
 #       model: deepseek-reasoner
 #       minutes: 0                # 0 / blank disables that trigger
 #       tokens: 300000
+#     - provider: openai          # declared window smaller than the real one
+#       model: square-model
+#       tokens: 900000
+#       contextWindow: 1000000   # real capacity; accepts completed responses above the declared window
 - insert:
     - id: idle-autocompact
       name: 'dsh-autocompact'
